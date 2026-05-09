@@ -2,6 +2,8 @@ import anthropic
 import json
 from dotenv import load_dotenv
 
+from config import ANTHROPIC_MODEL
+
 load_dotenv()
 
 client = anthropic.Anthropic()
@@ -16,7 +18,7 @@ def parse_intent(user_message: str) -> dict:
     Returns a dict.
     """
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=ANTHROPIC_MODEL,
         max_tokens=500,
         system="""You are an intent parser for a Facebook automation agent.
 Given the user's message, extract their intent as JSON with these fields:
@@ -49,7 +51,7 @@ Do not include any explanation or preamble — just the post text."""
         user_content += f"\n\nContext from previous posts for continuity:\n{context}"
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=ANTHROPIC_MODEL,
         max_tokens=300,
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
@@ -70,7 +72,7 @@ natural and relevant. No fluff. Just the comment text, nothing else."""
         user_content += f"\n\nThe post being commented on:\n{post_context}"
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=ANTHROPIC_MODEL,
         max_tokens=150,
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],

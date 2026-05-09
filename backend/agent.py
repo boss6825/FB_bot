@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 
 from session import load_session, save_session, clear_session
 from auth import load_credentials
+from config import ANTHROPIC_MODEL
 
 load_dotenv()
 
@@ -101,7 +102,7 @@ async def run_fb_task(task_description: str) -> str:
                     return "Login failed. Please check your credentials."
 
             # Hand off to browser-use agent with Claude as the LLM
-            llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+            llm = ChatAnthropic(model=ANTHROPIC_MODEL)
 
             agent = Agent(
                 task=task_description,
