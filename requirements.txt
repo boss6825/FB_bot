@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+browser-use
+playwright
+anthropic
+python-dotenv
+cryptography
+pydantic
