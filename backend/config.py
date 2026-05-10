@@ -1,8 +1,10 @@
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+ENV_FILE = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=ENV_FILE)
 
 # Latest IDs: https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")

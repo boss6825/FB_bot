@@ -1,10 +1,12 @@
 import anthropic
 import json
+from pathlib import Path
 from dotenv import load_dotenv
 
 from config import ANTHROPIC_MODEL
 
-load_dotenv()
+ENV_FILE = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=ENV_FILE)
 
 client = anthropic.Anthropic()
 

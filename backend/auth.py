@@ -4,17 +4,24 @@ from pathlib import Path
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv, set_key
 
-load_dotenv()
-
 STORAGE_DIR = Path(__file__).parent / "storage"
 STORAGE_DIR.mkdir(exist_ok=True)
 CREDENTIALS_FILE = STORAGE_DIR / "credentials.enc"
-ENV_FILE = Path(__file__).parent.parent / ".env"
+ENV_FILE = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=ENV_FILE)
+
+
+def _clean_env_value(value: str) -> str:
+    """Strip whitespace and optional surrounding quotes from env values."""
+    cleaned = (value or "").strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"'}:
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
 
 
 def get_or_create_encryption_key() -> bytes:
     """Load key from .env, or generate and save one if missing."""
-    key = os.getenv("ENCRYPTION_KEY", "").strip()
+    key = _clean_env_value(os.getenv("ENCRYPTION_KEY", ""))
     if not key:
         key = Fernet.generate_key().decode()
         # persist it into .env so it survives restarts
@@ -44,10 +51,22 @@ def load_credentials() -> dict | None:
     f = Fernet(key)
     try:
         decrypted = f.decrypt(CREDENTIALS_FILE.read_bytes())
-        return json.loads(decrypted)
+        creds = json.loads(decrypted)
+        if not isinstance(creds, dict):
+            return None
+        email = str(creds.get("email", "")).strip()
+        password = str(creds.get("password", "")).strip()
+        if not email or not password:
+            return None
+        return {"email": email, "password": password}
     except Exception:
         return None
 
 
 def credentials_exist() -> bool:
     return CREDENTIALS_FILE.exists()
+
+
+def credentials_valid() -> bool:
+    """Return True only when credentials file exists and can be decrypted/parsed."""
+    return load_credentials() is not None

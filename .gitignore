@@ -218,3 +218,6 @@ __marimo__/
 .streamlit/secrets.toml
 fb_session.json
 credentials.enc
+PROJECT_SUMMARY.md
+tmp-browser-use-profile
+backend/storage/fb_session.json.bak

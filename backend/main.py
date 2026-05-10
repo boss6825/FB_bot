@@ -1,20 +1,25 @@
 import asyncio
+import logging
 import sys
-import traceback
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 
 # Playwright needs subprocess support; SelectorEventLoop on Windows doesn't have it.
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+logger = logging.getLogger("fb_agent")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from auth import save_credentials, credentials_exist, load_credentials
+from auth import save_credentials, credentials_exist, credentials_valid, load_credentials
 from session import session_exists, clear_session
 from llm import parse_intent, generate_post_text, generate_comment_text, build_agent_task
 
-load_dotenv()
+ENV_FILE = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=ENV_FILE)
 
 app = FastAPI(title="Geodo FB Agent")
 
@@ -55,6 +60,7 @@ def setup_status():
     """Tell the frontend what's already configured."""
     return {
         "credentials_saved": credentials_exist(),
+        "credentials_valid": credentials_valid(),
         "session_active": session_exists(),
     }
 
@@ -88,6 +94,11 @@ async def chat(body: ChatRequest, background_tasks: BackgroundTasks):
         raise HTTPException(
             status_code=400,
             detail="No Facebook credentials saved. Please set up credentials first."
+        )
+    if not credentials_valid():
+        raise HTTPException(
+            status_code=400,
+            detail="Saved credentials are unreadable/invalid. Please save credentials again."
         )
 
     tasks[body.task_id] = {"status": "processing", "result": None, "error": None}
@@ -134,9 +145,39 @@ async def run_task(task_id: str, message: str):
         # Step 3: build the browser-use task string
         agent_task = build_agent_task(action, content, target_url)
 
-        # Step 4: run the agent (import here to avoid circular + lazy load)
+        # Step 4: run the agent in a dedicated thread with a Proactor loop.
+        # On Windows, asyncio.create_subprocess_exec (used by Playwright) requires
+        # ProactorEventLoop. Spawning a fresh loop in a worker thread guarantees this
+        # regardless of how uvicorn configured the main loop.
         from agent import run_fb_task
-        result = await run_fb_task(agent_task)
+
+        def _run_in_thread() -> str:
+            if sys.platform == "win32":
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(run_fb_task(agent_task))
+            finally:
+                loop.close()
+
+        result = await asyncio.to_thread(_run_in_thread)
+        failure_prefixes = (
+            "Login failed",
+            "Agent failed",
+            "Agent stopped",
+        )
+        is_failure = any(result.startswith(prefix) for prefix in failure_prefixes)
+
+        if is_failure:
+            tasks[task_id] = {
+                "status": "error",
+                "result": None,
+                "generated_content": content,
+                "action": action,
+                "error": result,
+            }
+            return
 
         tasks[task_id] = {
             "status": "done",
@@ -147,8 +188,23 @@ async def run_task(task_id: str, message: str):
         }
 
     except Exception as e:
+        # Log full traceback to backend console only; never leak it to the client.
+        logger.exception("Task %s failed", task_id)
         tasks[task_id] = {
             "status": "error",
             "result": None,
-            "error": str(e) or traceback.format_exc(),
+            "error": _user_facing_error(e),
         }
+
+
+def _user_facing_error(e: Exception) -> str:
+    """Map internal exceptions to short, safe messages for the UI."""
+    msg = str(e).strip()
+    name = type(e).__name__
+    if isinstance(e, NotImplementedError):
+        return "Browser automation couldn't start on this system. Check the backend logs."
+    if "credentials" in msg.lower():
+        return msg
+    if msg:
+        return f"{name}: {msg[:200]}"
+    return f"{name} (see backend logs for details)."
