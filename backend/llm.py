@@ -9,6 +9,32 @@ load_dotenv()
 client = anthropic.Anthropic()
 
 
+def _parse_json_dict(raw: str) -> dict | None:
+    """Parse a single JSON object; tolerate markdown fences or leading/trailing chatter."""
+    text = raw.strip()
+    attempts = [text]
+    if text.startswith("```"):
+        inner = text[3:].lstrip()
+        if inner.lower().startswith("json"):
+            inner = inner[4:].lstrip("\n")
+        inner = inner.strip()
+        if inner.endswith("```"):
+            inner = inner[:-3].strip()
+        attempts.append(inner)
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        attempts.append(text[start : end + 1])
+
+    for candidate in attempts:
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
 def parse_intent(user_message: str) -> dict:
     """
     Given a user's chat message, extract:
@@ -20,21 +46,39 @@ def parse_intent(user_message: str) -> dict:
     response = client.messages.create(
         model=ANTHROPIC_MODEL,
         max_tokens=500,
-        system="""You are an intent parser for a Facebook automation agent.
-Given the user's message, extract their intent as JSON with these fields:
-- action: "post" (create a new FB post) | "comment" (comment on a specific post) | "unknown"
-- target_url: the Facebook post URL to comment on, or null if posting
-- content_brief: a short description of what the post/comment should say
+        system="""You are an intent parser.
 
-Respond ONLY with valid JSON, no markdown, no explanation.""",
+Extract the user's Facebook automation request.
+
+Return ONLY valid minified JSON:
+{
+  "action": "post" | "comment" | "unknown",
+  "target_url": string or null,
+  "content_brief": string
+}
+
+Examples:
+
+User: post about AI changing sales
+Output:
+{"action":"post","target_url":null,"content_brief":"AI changing sales"}
+
+User: comment on https://facebook.com/post123 saying great insights
+Output:
+{"action":"comment","target_url":"https://facebook.com/post123","content_brief":"great insights"}
+
+No markdown. No explanation.""",
         messages=[{"role": "user", "content": user_message}],
     )
 
     raw = response.content[0].text.strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {"action": "unknown", "target_url": None, "content_brief": user_message}
+    print("RAW CLAUDE RESPONSE:", raw)
+
+    parsed = _parse_json_dict(raw)
+    if parsed is not None:
+        return parsed
+
+    return {"action": "unknown", "target_url": None, "content_brief": user_message}
 
 
 def generate_post_text(brief: str, context: str = "") -> str:

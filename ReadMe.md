@@ -11,7 +11,7 @@ cd backend
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
-# 2. Install dependencies
+# 2. Install dependencies (unified entry point at repo root)
 pip install -r ../requirements.txt
 
 # 3. Install Playwright browser
@@ -73,4 +73,3 @@ User message
 - Playwright session state (cookies) stored in `backend/storage/fb_session.json`
 - On each task, session validity is checked — re-login happens automatically if expired
 - Encryption key is auto-generated and saved to `.env` on first run
-

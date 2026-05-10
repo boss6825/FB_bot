@@ -1,5 +1,11 @@
 import asyncio
+import sys
+import traceback
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+
+# Playwright needs subprocess support; SelectorEventLoop on Windows doesn't have it.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -144,5 +150,5 @@ async def run_task(task_id: str, message: str):
         tasks[task_id] = {
             "status": "error",
             "result": None,
-            "error": str(e),
+            "error": str(e) or traceback.format_exc(),
         }
