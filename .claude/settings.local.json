@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\arpit\\\\OneDrive\\\\Desktop\\\\projects\\\\2026\\\\FB_bot\" -Recurse -Force)",
-      "Bash(Select-Object FullName)"
+      "Bash(Select-Object FullName)",
+      "PowerShell(npm *)",
+      "Bash(curl *)"
     ]
   }
 }

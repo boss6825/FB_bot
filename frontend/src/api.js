@@ -11,6 +11,7 @@ async function jsonFetch(url, opts = {}) {
 }
 
 export const api = {
+  health: () => jsonFetch('/health'),
   setupStatus: () => jsonFetch('/status/setup'),
   saveCredentials: (email, password) =>
     jsonFetch('/auth/credentials', {

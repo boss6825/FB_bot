@@ -1,6 +1,8 @@
+import asyncio
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 from browser_use import Agent, BrowserSession
 from browser_use.llm import ChatAnthropic
@@ -22,6 +24,107 @@ BROWSER_USER_DATA_DIR = os.getenv(
     "BROWSER_USER_DATA_DIR",
     str(Path(__file__).parent / "storage" / "tmp-browser-use-profile"),
 )
+
+POST_CLICK_FALLBACK_ATTEMPTS = 3
+POST_CLICK_FALLBACK_SLEEP_SECONDS = 1.2
+
+
+def _is_post_publish_task(task_description: str) -> bool:
+    text = task_description.lower()
+    return "create a new facebook post" in text and "click the post button" in text
+
+
+async def _evaluate_js(browser_session: BrowserSession, expression: str) -> Any:
+    cdp_session = await browser_session.get_or_create_cdp_session()
+    result = await cdp_session.cdp_client.send.Runtime.evaluate(
+        params={"expression": expression, "returnByValue": True, "awaitPromise": True},
+        session_id=cdp_session.session_id,
+    )
+    if result.get("exceptionDetails"):
+        raise RuntimeError(result["exceptionDetails"].get("text", "JavaScript evaluation failed"))
+    return result.get("result", {}).get("value")
+
+
+async def _composer_has_visible_post_button(browser_session: BrowserSession) -> bool:
+    script = r"""
+(() => {
+  const isVisible = (el) => !!el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
+  const isEnabled = (el) => !!el && el.getAttribute('aria-disabled') !== 'true';
+  const candidates = [
+    ...document.querySelectorAll('div[role="button"][aria-label="Post"], button[aria-label="Post"], [role="button"][aria-label="Post"]'),
+    ...[...document.querySelectorAll('div[role="button"],button')].filter(el => (el.textContent || '').trim() === 'Post')
+  ];
+  return candidates.some(el => isVisible(el) && isEnabled(el));
+})()
+"""
+    value = await _evaluate_js(browser_session, script)
+    return bool(value)
+
+
+async def _force_click_post_button(browser_session: BrowserSession) -> tuple[bool, str]:
+    click_script = r"""
+(() => {
+  const isVisible = (el) => !!el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
+  const isEnabled = (el) => !!el && el.getAttribute('aria-disabled') !== 'true';
+  const clickElement = (el) => {
+    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type => {
+      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+    });
+    if (typeof el.click === 'function') el.click();
+  };
+
+  const selectorCandidates = [
+    'div[role="button"][aria-label="Post"]',
+    'button[aria-label="Post"]',
+    '[role="button"][aria-label="Post"]'
+  ];
+
+  for (const selector of selectorCandidates) {
+    const nodes = [...document.querySelectorAll(selector)];
+    for (const node of nodes) {
+      if (isVisible(node) && isEnabled(node)) {
+        clickElement(node);
+        return { clicked: true, strategy: selector };
+      }
+    }
+  }
+
+  const textMatches = [...document.querySelectorAll('div[role="button"],button')]
+    .filter(el => (el.textContent || '').trim() === 'Post');
+  for (const node of textMatches) {
+    if (isVisible(node) && isEnabled(node)) {
+      clickElement(node);
+      return { clicked: true, strategy: 'text-content' };
+    }
+  }
+
+  return { clicked: false, strategy: 'none' };
+})()
+"""
+
+    before_visible = await _composer_has_visible_post_button(browser_session)
+    if not before_visible:
+        return False, "No visible Post button found in composer before fallback click."
+
+    for attempt in range(1, POST_CLICK_FALLBACK_ATTEMPTS + 1):
+        value = await _evaluate_js(browser_session, click_script)
+        logger.info("Post-click JS fallback attempt %s result: %s", attempt, value)
+        await asyncio.sleep(POST_CLICK_FALLBACK_SLEEP_SECONDS)
+
+        after_visible = await _composer_has_visible_post_button(browser_session)
+        if not after_visible:
+            return True, f"Deterministic Post click succeeded via fallback (attempt {attempt})."
+
+    return False, "Post button remained visible after deterministic fallback clicks."
+
+
+async def _persist_session_state(browser_session: BrowserSession) -> None:
+    try:
+        updated_state = await browser_session.export_storage_state()
+        if updated_state:
+            save_session(updated_state)
+    except Exception:
+        logger.exception("Could not export storage_state after agent run")
 
 
 def _build_task(task_description: str, has_session: bool) -> str:
@@ -48,6 +151,14 @@ def _build_task(task_description: str, has_session: bool) -> str:
         "immediately with success=true. Do not keep verifying or navigating.\n"
         "- If the composer is already open and the Post button is enabled, click Post "
         "immediately and finish.\n"
+        "- RECOVERY RULE: if a click on Post fails with 'Element index ... not available', "
+        "do not retry the same index. Switch to the evaluate action immediately and click "
+        "Post by stable selector/text.\n"
+        "- VALID ACTION FORMAT: action objects must use browser-use action names and fields "
+        "(example: {'click': {'index': 123}}). Never use unknown fields like "
+        "{'click': {'element_index': 123}}.\n"
+        "- POST CONTENT RULE: do not alter text content, do not add emojis, and do not open "
+        "'Add to your post' menus unless strictly required.\n"
     )
 
     login_block = (
@@ -110,10 +221,23 @@ async def run_fb_task(task_description: str) -> str:
             flash_mode=True,
             enable_planning=False,
             max_actions_per_step=10,
+            max_failures=2,
+            final_response_after_failure=False,
+            include_tool_call_examples=True,
         )
 
         history = await agent.run(max_steps=35)
         final_result = history.final_result()
+
+        if not history.is_done() and _is_post_publish_task(task_description):
+            try:
+                clicked, fallback_message = await _force_click_post_button(browser_session)
+                if clicked:
+                    await _persist_session_state(browser_session)
+                    return fallback_message
+                logger.warning("Post publish fallback did not complete: %s", fallback_message)
+            except Exception:
+                logger.exception("Deterministic post publish fallback failed")
 
         if history.has_errors() and not history.is_done():
             last_error = next((err for err in reversed(history.errors()) if err), None)
@@ -122,13 +246,7 @@ async def run_fb_task(task_description: str) -> str:
         if not history.is_done():
             return "Agent stopped before confirming the task was done."
 
-        # Persist any cookie/session changes made during the task.
-        try:
-            updated_state = await browser_session.export_storage_state()
-            if updated_state:
-                save_session(updated_state)
-        except Exception:
-            logger.exception("Could not export storage_state after agent run")
+        await _persist_session_state(browser_session)
 
         return final_result or "Task completed."
 

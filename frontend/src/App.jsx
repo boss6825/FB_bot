@@ -1,252 +1,371 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, uuid } from './api.js'
+import Sidebar from './components/Sidebar.jsx'
+import ChatView from './components/ChatView.jsx'
+import DashboardView from './components/DashboardView.jsx'
+import HistoryView from './components/HistoryView.jsx'
+import CredentialModal from './components/CredentialModal.jsx'
 
 const POLL_INTERVAL_MS = 2000
+const POLL_MAX_ATTEMPTS = 240 // 8 minutes
+const TASK_STORAGE_KEY = 'fb_agent_tasks'
+
+function loadTasks() {
+  try {
+    return JSON.parse(localStorage.getItem(TASK_STORAGE_KEY) || '{}')
+  } catch {
+    return {}
+  }
+}
+
+function saveTasks(tasks) {
+  try {
+    localStorage.setItem(TASK_STORAGE_KEY, JSON.stringify(tasks))
+  } catch {
+    /* ignore */
+  }
+}
 
 export default function App() {
-  const [setup, setSetup] = useState({ credentials_saved: false, session_active: false })
-  const [showCreds, setShowCreds] = useState(false)
-  const [messages, setMessages] = useState([
-    {
-      role: 'bot',
-      text: "Hi! I'm your Facebook agent. Tell me what to do — e.g. \"post about AI changing sales\" or \"comment on <fb-url> saying nice work\".",
-    },
-  ])
-  const [input, setInput] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [draft, setDraft] = useState(null)   // { id, action } | null
-  const [draftText, setDraftText] = useState('')
-  const chatEndRef = useRef(null)
+  const [page, setPage] = useState('chat')
+  const [messages, setMessages] = useState([])
+  const [tasks, setTasks] = useState(loadTasks)
+  const [backendConnected, setBackendConnected] = useState(false)
+  const [isSetup, setIsSetup] = useState(false)
+  const [showCredModal, setShowCredModal] = useState(false)
+  const [isSending, setIsSending] = useState(false)
+  const credModalAutoShown = useRef(false)
 
-  useEffect(() => { refreshSetup() }, [])
-
+  // Persist tasks
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, draft])
+    saveTasks(tasks)
+  }, [tasks])
 
+  // Backend health + setup polling
   useEffect(() => {
-    if (!setup.credentials_saved) setShowCreds(true)
-  }, [setup.credentials_saved])
+    checkBackend()
+    const interval = setInterval(checkBackend, 30000)
+    return () => clearInterval(interval)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
-  async function refreshSetup() {
+  async function checkBackend() {
     try {
-      const s = await api.setupStatus()
-      setSetup(s)
-    } catch (e) {
-      pushMsg({ role: 'error', text: `Couldn't reach backend: ${e.message}. Make sure FastAPI is running on :8000.` })
+      await api.health()
+      setBackendConnected(true)
+      try {
+        const setup = await api.setupStatus()
+        const ok = !!setup.credentials_saved && !!setup.credentials_valid
+        setIsSetup(ok)
+        if (!ok && !credModalAutoShown.current) {
+          credModalAutoShown.current = true
+          setShowCredModal(true)
+        }
+      } catch {
+        /* ignore */
+      }
+    } catch {
+      setBackendConnected(false)
     }
   }
 
-  function pushMsg(m) {
+  // ── Message helpers ──────────────────────────────────────────────
+  const pushMessage = useCallback((msg) => {
+    const m = { id: uuid(), timestamp: Date.now(), ...msg }
     setMessages((prev) => [...prev, m])
-  }
+    return m.id
+  }, [])
 
-  async function pollUntil(taskId, ...terminalStatuses) {
-    while (true) {
+  const updateMessage = useCallback((id, updates) => {
+    setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...updates } : m)))
+  }, [])
+
+  const replaceMessage = useCallback((id, newMsg) => {
+    setMessages((prev) =>
+      prev.map((m) => (m.id === id ? { id: m.id, timestamp: m.timestamp, ...newMsg } : m)),
+    )
+  }, [])
+
+  const removeMessage = useCallback((id) => {
+    setMessages((prev) => prev.filter((m) => m.id !== id))
+  }, [])
+
+  // ── Task store helpers ───────────────────────────────────────────
+  const upsertTask = useCallback((taskId, patch) => {
+    setTasks((prev) => ({
+      ...prev,
+      [taskId]: { id: taskId, ...(prev[taskId] || {}), ...patch },
+    }))
+  }, [])
+
+  // ── Polling ──────────────────────────────────────────────────────
+  async function pollUntil(taskId, terminalStatuses) {
+    let attempts = 0
+    while (attempts < POLL_MAX_ATTEMPTS) {
+      attempts++
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS))
       try {
         const data = await api.getTask(taskId)
         if (terminalStatuses.includes(data.status)) return data
       } catch (e) {
-        return { status: 'error', error: e.message }
+        if (attempts >= 3) return { status: 'error', error: e.message || 'Lost connection' }
       }
     }
+    return { status: 'error', error: 'Task timed out.' }
   }
 
-  async function handleSend() {
-    const text = input.trim()
-    if (!text || busy) return
-    if (!setup.credentials_saved) {
-      setShowCreds(true)
-      return
-    }
+  // ── Send command → create draft ──────────────────────────────────
+  const handleSendMessage = useCallback(
+    async (text) => {
+      if (isSending) return
 
-    pushMsg({ role: 'user', text })
-    setInput('')
-    setBusy(true)
+      pushMessage({ type: 'user', content: text })
 
-    const taskId = uuid()
-    pushMsg({ role: 'bot', text: 'Generating draft', pending: true, taskId })
-
-    try {
-      await api.createDraft(text, taskId)
-      const result = await pollUntil(taskId, 'draft', 'error')
-
-      if (result.status === 'error') {
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.taskId === taskId
-              ? { role: 'error', text: `Failed: ${result.error || 'unknown error'}` }
-              : m
-          )
-        )
-        setBusy(false)
+      if (!backendConnected) {
+        pushMessage({
+          type: 'error',
+          content:
+            'Backend is offline. Start the server with: uvicorn main:app --reload --port 8000',
+        })
+        return
+      }
+      if (!isSetup) {
+        pushMessage({
+          type: 'error',
+          content: 'Please connect your Facebook account first.',
+        })
+        setShowCredModal(true)
         return
       }
 
-      // Draft ready — replace spinner with prompt, show review panel
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.taskId === taskId
-            ? { role: 'bot', text: "Here's your draft — edit if needed, then publish:" }
-            : m
-        )
-      )
-      setDraft({ id: taskId, action: result.action })
-      setDraftText(result.generated_content || '')
-    } catch (e) {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.taskId === taskId ? { role: 'error', text: `Error: ${e.message}` } : m
-        )
-      )
-      setBusy(false)
-    }
-  }
+      const thinkingId = pushMessage({ type: 'thinking' })
+      setIsSending(true)
 
-  async function handlePublish() {
-    const finalText = draftText.trim()
-    if (!finalText || !draft) return
+      const taskId = uuid()
+      upsertTask(taskId, {
+        command: text,
+        status: 'processing',
+        timestamp: Date.now(),
+      })
 
-    const { id: draftId, action } = draft
-    setDraft(null)
+      try {
+        await api.createDraft(text, taskId)
+        const result = await pollUntil(taskId, ['draft', 'error'])
 
-    const pubTaskId = uuid()
-    pushMsg({ role: 'bot', text: 'Publishing', pending: true, taskId: pubTaskId })
+        if (result.status === 'error') {
+          const errMsg = result.error || 'Failed to create draft.'
+          upsertTask(taskId, { status: 'error', error: errMsg, completedAt: Date.now() })
+          replaceMessage(thinkingId, {
+            type: 'task',
+            task: {
+              id: taskId,
+              status: 'error',
+              command: text,
+              error: errMsg,
+            },
+          })
+          setIsSending(false)
+          return
+        }
 
-    try {
-      await api.publishDraft(draftId, finalText)
-      const result = await pollUntil(draftId, 'done', 'error')
-
-      setMessages((prev) =>
-        prev.map((m) => {
-          if (m.taskId !== pubTaskId) return m
-          if (result.status === 'error') {
-            return { role: 'error', text: `Failed: ${result.error || 'unknown error'}` }
-          }
-          return {
-            role: 'bot',
-            text: result.result || 'Posted!',
-            generated: finalText,
-            action,
-          }
+        // Draft ready
+        const generated = result.generated_content || ''
+        const action = result.action || 'post'
+        upsertTask(taskId, {
+          status: 'draft',
+          generated,
+          action,
         })
-      )
-    } catch (e) {
+
+        replaceMessage(thinkingId, {
+          type: 'draft',
+          draft: {
+            id: taskId,
+            action,
+            content: generated,
+            status: 'draft',
+          },
+        })
+      } catch (e) {
+        const errMsg = e.message || 'Failed to send command.'
+        upsertTask(taskId, { status: 'error', error: errMsg, completedAt: Date.now() })
+        replaceMessage(thinkingId, {
+          type: 'error',
+          content: errMsg,
+        })
+      } finally {
+        setIsSending(false)
+      }
+    },
+    [backendConnected, isSetup, isSending, pushMessage, replaceMessage, upsertTask],
+  )
+
+  // ── Publish a draft ──────────────────────────────────────────────
+  const handlePublishDraft = useCallback(
+    async (draftId, finalText) => {
+      const trimmed = (finalText || '').trim()
+      if (!trimmed) return
+
+      // Find draft message and flip its status to 'publishing'
       setMessages((prev) =>
         prev.map((m) =>
-          m.taskId === pubTaskId ? { role: 'error', text: `Error: ${e.message}` } : m
-        )
+          m.type === 'draft' && m.draft?.id === draftId
+            ? { ...m, draft: { ...m.draft, content: trimmed, status: 'publishing' } }
+            : m,
+        ),
       )
-    } finally {
-      setBusy(false)
-      refreshSetup()
-    }
-  }
 
-  function handleCancelDraft() {
-    setDraft(null)
-    setDraftText('')
-    pushMsg({ role: 'bot', text: 'Draft cancelled. You can try a different topic.' })
-    setBusy(false)
-  }
+      upsertTask(draftId, { status: 'publishing', generated: trimmed })
 
-  async function handleLogout() {
-    try {
-      await api.logout()
-      pushMsg({ role: 'bot', text: 'Session cleared. Next task will re-login.' })
-      refreshSetup()
-    } catch (e) {
-      pushMsg({ role: 'error', text: `Logout failed: ${e.message}` })
-    }
-  }
+      try {
+        await api.publishDraft(draftId, trimmed)
+        const result = await pollUntil(draftId, ['done', 'error'])
+
+        const completedAt = Date.now()
+
+        if (result.status === 'error') {
+          const errMsg = result.error || 'Failed to publish.'
+          upsertTask(draftId, {
+            status: 'error',
+            error: errMsg,
+            completedAt,
+          })
+          // Replace draft card with error task card
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.type === 'draft' && m.draft?.id === draftId
+                ? {
+                    ...m,
+                    type: 'task',
+                    task: {
+                      id: draftId,
+                      status: 'error',
+                      error: errMsg,
+                      generated: trimmed,
+                    },
+                    draft: undefined,
+                  }
+                : m,
+            ),
+          )
+          return
+        }
+
+        const action = tasks[draftId]?.action || result.action || 'post'
+        upsertTask(draftId, {
+          status: 'done',
+          result: result.result || 'Posted!',
+          generated: trimmed,
+          action,
+          completedAt,
+        })
+
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.type === 'draft' && m.draft?.id === draftId
+              ? {
+                  ...m,
+                  type: 'task',
+                  task: {
+                    id: draftId,
+                    status: 'done',
+                    result: result.result || 'Posted!',
+                    generated: trimmed,
+                    action,
+                  },
+                  draft: undefined,
+                }
+              : m,
+          ),
+        )
+      } catch (e) {
+        const errMsg = e.message || 'Failed to publish.'
+        upsertTask(draftId, { status: 'error', error: errMsg, completedAt: Date.now() })
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.type === 'draft' && m.draft?.id === draftId
+              ? {
+                  ...m,
+                  type: 'task',
+                  task: { id: draftId, status: 'error', error: errMsg },
+                  draft: undefined,
+                }
+              : m,
+          ),
+        )
+      }
+    },
+    [tasks, upsertTask],
+  )
+
+  const handleCancelDraft = useCallback(
+    (draftId) => {
+      setMessages((prev) =>
+        prev
+          .filter((m) => !(m.type === 'draft' && m.draft?.id === draftId))
+          .concat([
+            {
+              id: uuid(),
+              timestamp: Date.now(),
+              type: 'bot',
+              content: 'Draft cancelled. Send another command when you’re ready.',
+            },
+          ]),
+      )
+      setTasks((prev) => {
+        const copy = { ...prev }
+        delete copy[draftId]
+        return copy
+      })
+    },
+    [],
+  )
+
+  // ── Refresh handler for dashboard ────────────────────────────────
+  const handleDashboardRefresh = useCallback(() => {
+    checkBackend()
+  }, [])
 
   return (
-    <div className="app">
-      <header className="header">
-        <div>
-          <h1>Geodo FB Agent</h1>
-          <div className="sub">Natural-language Facebook automation</div>
-        </div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <span className={`status-pill ${setup.credentials_saved ? 'ok' : 'warn'}`}>
-            {setup.credentials_saved ? 'Creds ✓' : 'No creds'}
-          </span>
-          <span className={`status-pill ${setup.session_active ? 'ok' : 'warn'}`}>
-            {setup.session_active ? 'Session ✓' : 'No session'}
-          </span>
-          <button className="ghost" onClick={() => setShowCreds(true)}>Creds</button>
-          <button className="ghost" onClick={handleLogout} disabled={!setup.session_active}>
-            Logout
-          </button>
-        </div>
-      </header>
-
-      <div className="chat">
-        {messages.map((m, i) => (
-          <div key={i} className={`msg ${m.role}`}>
-            {m.pending ? (
-              <span>
-                {m.text}
-                <span className="dots" />
-              </span>
-            ) : (
-              <span>{m.text}</span>
-            )}
-            {m.generated && (
-              <div className="gen">
-                <strong>Published {m.action}:</strong>
-                <br />
-                {m.generated}
-              </div>
-            )}
-          </div>
-        ))}
-        <div ref={chatEndRef} />
-      </div>
-
-      {draft ? (
-        <div className="draft-panel">
-          <label>Review &amp; edit before publishing:</label>
-          <textarea
-            value={draftText}
-            onChange={(e) => setDraftText(e.target.value)}
-            rows={5}
-            autoFocus
+    <div style={styles.layout}>
+      <Sidebar
+        currentPage={page}
+        onNavigate={setPage}
+        backendConnected={backendConnected}
+        isSetup={isSetup}
+        onOpenSettings={() => setShowCredModal(true)}
+      />
+      <main style={styles.main}>
+        {page === 'chat' && (
+          <ChatView
+            messages={messages}
+            onSendMessage={handleSendMessage}
+            isSending={isSending}
+            bubbleStyle="rounded"
+            backendConnected={backendConnected}
+            isSetup={isSetup}
+            onPublishDraft={handlePublishDraft}
+            onCancelDraft={handleCancelDraft}
           />
-          <div className="draft-footer">
-            <span className="char-count">{draftText.length} chars</span>
-            <div className="draft-actions">
-              <button className="ghost" onClick={handleCancelDraft}>Cancel</button>
-              <button onClick={handlePublish} disabled={!draftText.trim()}>
-                Publish
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : (
-        <div className="input-row">
-          <input
-            type="text"
-            placeholder='e.g. "post about AI changing sales"'
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-            disabled={busy}
-          />
-          <button onClick={handleSend} disabled={busy || !input.trim()}>
-            {busy ? 'Working' : 'Send'}
-          </button>
-        </div>
-      )}
+        )}
+        {page === 'dashboard' && (
+          <DashboardView tasks={tasks} onRefresh={handleDashboardRefresh} />
+        )}
+        {page === 'history' && <HistoryView tasks={tasks} />}
+      </main>
 
-      {showCreds && (
-        <CredentialsModal
-          onClose={() => setShowCreds(false)}
-          onSaved={() => {
-            setShowCreds(false)
-            pushMsg({ role: 'bot', text: 'Credentials saved. You can send commands now.' })
-            refreshSetup()
+      {showCredModal && (
+        <CredentialModal
+          isSetup={isSetup}
+          onClose={() => setShowCredModal(false)}
+          onSave={() => {
+            setIsSetup(true)
+            setShowCredModal(false)
+            checkBackend()
+          }}
+          onLogout={() => {
+            setIsSetup(false)
+            checkBackend()
           }}
         />
       )}
@@ -254,61 +373,18 @@ export default function App() {
   )
 }
 
-function CredentialsModal({ onClose, onSaved }) {
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [saving, setSaving] = useState(false)
-  const [error, setError] = useState('')
-
-  async function handleSave() {
-    if (!email || !password) {
-      setError('Both fields required.')
-      return
-    }
-    setSaving(true)
-    setError('')
-    try {
-      await api.saveCredentials(email, password)
-      onSaved()
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  return (
-    <div className="modal-bg" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2>Facebook Credentials</h2>
-        <p>
-          Stored locally and encrypted (Fernet/AES-128). Used only to log in to Facebook
-          for the agent. Never sent anywhere else.
-        </p>
-        <label>Email</label>
-        <input
-          type="email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          placeholder="you@example.com"
-          autoFocus
-        />
-        <label>Password</label>
-        <input
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          placeholder="••••••••"
-          onKeyDown={(e) => e.key === 'Enter' && handleSave()}
-        />
-        {error && <div style={{ color: 'var(--error)', fontSize: 13, marginBottom: 8 }}>{error}</div>}
-        <div className="modal-actions">
-          <button className="ghost" onClick={onClose} disabled={saving}>Cancel</button>
-          <button onClick={handleSave} disabled={saving}>
-            {saving ? 'Saving…' : 'Save'}
-          </button>
-        </div>
-      </div>
-    </div>
-  )
+const styles = {
+  layout: {
+    display: 'flex',
+    height: '100vh',
+    width: '100vw',
+    overflow: 'hidden',
+    background: 'var(--bg-alt)',
+  },
+  main: {
+    flex: 1,
+    display: 'flex',
+    overflow: 'hidden',
+    background: '#fff',
+  },
 }
