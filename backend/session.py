@@ -1,4 +1,6 @@
 import json
+import os
+import shutil
 from pathlib import Path
 
 STORAGE_DIR = Path(__file__).parent / "storage"
@@ -29,3 +31,16 @@ def clear_session() -> None:
     """Nuke session — forces re-login on next run."""
     if SESSION_FILE.exists():
         SESSION_FILE.unlink()
+
+
+def clear_browser_profile() -> None:
+    """
+    Remove persistent Playwright profile used by browser-use.
+    This ensures account switch is clean even when keep-alive profile exists.
+    """
+    default_profile_dir = Path(__file__).parent / "storage" / "tmp-browser-use-profile"
+    configured_dir = os.getenv("BROWSER_USER_DATA_DIR", str(default_profile_dir))
+    profile_dir = Path(configured_dir)
+
+    if profile_dir.exists() and profile_dir.is_dir():
+        shutil.rmtree(profile_dir, ignore_errors=True)

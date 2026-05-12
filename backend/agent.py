@@ -27,11 +27,18 @@ BROWSER_USER_DATA_DIR = os.getenv(
 
 POST_CLICK_FALLBACK_ATTEMPTS = 3
 POST_CLICK_FALLBACK_SLEEP_SECONDS = 1.2
+COMMENT_CLICK_FALLBACK_ATTEMPTS = 3
+COMMENT_CLICK_FALLBACK_SLEEP_SECONDS = 1.0
 
 
 def _is_post_publish_task(task_description: str) -> bool:
     text = task_description.lower()
     return "create a new facebook post" in text and "click the post button" in text
+
+
+def _is_comment_publish_task(task_description: str) -> bool:
+    text = task_description.lower()
+    return "leave a comment with exactly this text" in text and "click the comment button" in text
 
 
 async def _evaluate_js(browser_session: BrowserSession, expression: str) -> Any:
@@ -118,6 +125,79 @@ async def _force_click_post_button(browser_session: BrowserSession) -> tuple[boo
     return False, "Post button remained visible after deterministic fallback clicks."
 
 
+async def _comment_composer_has_visible_submit_button(browser_session: BrowserSession) -> bool:
+    script = r"""
+(() => {
+  const isVisible = (el) => !!el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
+  const isEnabled = (el) => !!el && el.getAttribute('aria-disabled') !== 'true' && !(el.disabled === true);
+  const directCandidates = [
+    ...document.querySelectorAll('div[role="button"][aria-label="Comment"], button[aria-label="Comment"], [role="button"][aria-label="Comment"]')
+  ];
+  const textCandidates = [...document.querySelectorAll('div[role="button"],button')]
+    .filter(el => (el.textContent || '').trim() === 'Comment');
+  const candidates = [...directCandidates, ...textCandidates];
+  return candidates.some(el => isVisible(el) && isEnabled(el));
+})()
+"""
+    value = await _evaluate_js(browser_session, script)
+    return bool(value)
+
+
+async def _force_click_comment_button(browser_session: BrowserSession) -> tuple[bool, str]:
+    click_script = r"""
+(() => {
+  const isVisible = (el) => !!el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
+  const isEnabled = (el) => !!el && el.getAttribute('aria-disabled') !== 'true' && !(el.disabled === true);
+  const clickElement = (el) => {
+    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type => {
+      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+    });
+    if (typeof el.click === 'function') el.click();
+  };
+
+  const selectorCandidates = [
+    'div[role="button"][aria-label="Comment"]',
+    'button[aria-label="Comment"]',
+    '[role="button"][aria-label="Comment"]'
+  ];
+
+  for (const selector of selectorCandidates) {
+    const nodes = [...document.querySelectorAll(selector)];
+    for (const node of nodes) {
+      if (isVisible(node) && isEnabled(node)) {
+        clickElement(node);
+        return { clicked: true, strategy: selector };
+      }
+    }
+  }
+
+  const textMatches = [...document.querySelectorAll('div[role="button"],button')]
+    .filter(el => (el.textContent || '').trim() === 'Comment');
+  for (const node of textMatches) {
+    if (isVisible(node) && isEnabled(node)) {
+      clickElement(node);
+      return { clicked: true, strategy: 'text-content' };
+    }
+  }
+
+  return { clicked: false, strategy: 'none' };
+})()
+"""
+
+    before_visible = await _comment_composer_has_visible_submit_button(browser_session)
+    if not before_visible:
+        return False, "No visible Comment submit button found before fallback click."
+
+    for attempt in range(1, COMMENT_CLICK_FALLBACK_ATTEMPTS + 1):
+        value = await _evaluate_js(browser_session, click_script)
+        logger.info("Comment-click JS fallback attempt %s result: %s", attempt, value)
+        if value and value.get("clicked"):
+            await asyncio.sleep(COMMENT_CLICK_FALLBACK_SLEEP_SECONDS)
+            return True, f"Deterministic Comment click executed via fallback (attempt {attempt})."
+
+    return False, "Comment submit fallback could not click any visible Comment button."
+
+
 async def _persist_session_state(browser_session: BrowserSession) -> None:
     try:
         updated_state = await browser_session.export_storage_state()
@@ -159,6 +239,11 @@ def _build_task(task_description: str, has_session: bool) -> str:
         "{'click': {'element_index': 123}}.\n"
         "- POST CONTENT RULE: do not alter text content, do not add emojis, and do not open "
         "'Add to your post' menus unless strictly required.\n"
+        "- COMMENT FLOW RULE: when task is to comment on a specific post URL, stay on that exact "
+        "target post page, type the exact provided comment text, then submit comment.\n"
+        "- COMMENT RECOVERY RULE: if comment submission click fails with 'Element index ... not "
+        "available', switch to evaluate action and click a visible Comment submit button by stable "
+        "selector/text instead of retrying stale indices.\n"
     )
 
     login_block = (
@@ -229,15 +314,25 @@ async def run_fb_task(task_description: str) -> str:
         history = await agent.run(max_steps=35)
         final_result = history.final_result()
 
-        if not history.is_done() and _is_post_publish_task(task_description):
-            try:
-                clicked, fallback_message = await _force_click_post_button(browser_session)
-                if clicked:
-                    await _persist_session_state(browser_session)
-                    return fallback_message
-                logger.warning("Post publish fallback did not complete: %s", fallback_message)
-            except Exception:
-                logger.exception("Deterministic post publish fallback failed")
+        if not history.is_done():
+            if _is_post_publish_task(task_description):
+                try:
+                    clicked, fallback_message = await _force_click_post_button(browser_session)
+                    if clicked:
+                        await _persist_session_state(browser_session)
+                        return fallback_message
+                    logger.warning("Post publish fallback did not complete: %s", fallback_message)
+                except Exception:
+                    logger.exception("Deterministic post publish fallback failed")
+            elif _is_comment_publish_task(task_description):
+                try:
+                    clicked, fallback_message = await _force_click_comment_button(browser_session)
+                    if clicked:
+                        await _persist_session_state(browser_session)
+                        return fallback_message
+                    logger.warning("Comment publish fallback did not complete: %s", fallback_message)
+                except Exception:
+                    logger.exception("Deterministic comment publish fallback failed")
 
         if history.has_errors() and not history.is_done():
             last_error = next((err for err in reversed(history.errors()) if err), None)

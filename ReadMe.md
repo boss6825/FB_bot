@@ -65,6 +65,8 @@ uvicorn main:app --reload --port 8000
 | POST   | `/auth/credentials` | Save FB credentials (run once)           |
 | POST   | `/auth/logout`      | Clear saved session                      |
 | POST   | `/chat`             | Send a natural language command          |
+| POST   | `/draft`            | Create post/comment draft (review first) |
+| POST   | `/draft/{id}/publish` | Publish reviewed/edited draft          |
 | GET    | `/task/{task_id}`   | Poll task status + result                |
 
 
@@ -83,6 +85,23 @@ curl -X POST http://localhost:8000/chat \
 
 # 3. Poll for result
 curl http://localhost:8000/task/abc123
+```
+
+## Draft-First Comment by Link (Recommended)
+
+```bash
+# 1. Create a draft comment for a specific Facebook post URL
+curl -X POST http://localhost:8000/draft \
+  -H "Content-Type: application/json" \
+  -d '{"task_id":"draft-1","action":"comment","target_url":"https://www.facebook.com/zuck/posts/10102577175875681","content_brief":"thank them for sharing"}'
+
+# 2. Poll until status=draft and copy generated_content
+curl http://localhost:8000/task/draft-1
+
+# 3. Publish reviewed/edited text
+curl -X POST http://localhost:8000/draft/draft-1/publish \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Great insight, thanks for sharing this."}'
 ```
 
 ## Architecture

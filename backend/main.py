@@ -2,6 +2,7 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 
 # Playwright needs subprocess support; SelectorEventLoop on Windows doesn't have it.
@@ -14,8 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from auth import save_credentials, credentials_exist, credentials_valid, load_credentials
-from session import session_exists, clear_session
+from auth import save_credentials, clear_credentials, credentials_exist, credentials_valid, load_credentials
+from session import session_exists, clear_session, clear_browser_profile
 from llm import parse_intent, generate_post_text, generate_comment_text, build_agent_task
 
 ENV_FILE = Path(__file__).parent / ".env"
@@ -46,6 +47,16 @@ class CredentialsRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     task_id: str  # client generates this (e.g. uuid)
+
+
+class DraftRequest(BaseModel):
+    task_id: str  # client generates this (e.g. uuid)
+    # Legacy free-text path (still supported)
+    message: str | None = None
+    # Structured path
+    action: str | None = None
+    target_url: str | None = None
+    content_brief: str | None = None
 
 
 class PublishDraftRequest(BaseModel):
@@ -82,9 +93,11 @@ def set_credentials(body: CredentialsRequest):
 
 @app.post("/auth/logout")
 def logout():
-    """Wipe saved session (forces re-login on next task)."""
+    """Disconnect account by wiping credentials + session + local browser profile."""
+    clear_credentials()
     clear_session()
-    return {"message": "Session cleared."}
+    clear_browser_profile()
+    return {"message": "Credentials removed successfully."}
 
 
 @app.post("/chat")
@@ -120,7 +133,7 @@ def get_task_status(task_id: str):
 
 
 @app.post("/draft")
-async def create_draft_endpoint(body: ChatRequest, background_tasks: BackgroundTasks):
+async def create_draft_endpoint(body: DraftRequest, background_tasks: BackgroundTasks):
     """
     Parse intent and generate post/comment text — but do NOT run the browser yet.
     Returns immediately; poll /task/{task_id} until status == 'draft'.
@@ -138,7 +151,7 @@ async def create_draft_endpoint(body: ChatRequest, background_tasks: BackgroundT
         "action": None,
         "intent": None,
     }
-    background_tasks.add_task(create_draft, body.task_id, body.message)
+    background_tasks.add_task(create_draft, body.task_id, body)
     return {"task_id": body.task_id, "status": "processing"}
 
 
@@ -175,6 +188,17 @@ async def run_task(task_id: str, message: str):
         action = intent.get("action", "unknown")
         brief = intent.get("content_brief", message)
         target_url = intent.get("target_url")
+
+        if action == "comment":
+            normalized_url = _normalize_facebook_url(target_url)
+            if not normalized_url:
+                tasks[task_id] = {
+                    "status": "error",
+                    "result": None,
+                    "error": "Comment requests must include a valid Facebook post URL.",
+                }
+                return
+            target_url = normalized_url
 
         if action == "unknown":
             tasks[task_id] = {
@@ -234,6 +258,7 @@ async def run_task(task_id: str, message: str):
             "result": result,
             "generated_content": content,
             "action": action,
+            "target_url": target_url,
             "error": None,
         }
 
@@ -247,12 +272,64 @@ async def run_task(task_id: str, message: str):
         }
 
 
-async def create_draft(task_id: str, message: str):
+async def create_draft(task_id: str, body: DraftRequest):
     """Parse intent and generate text; stop before browser automation."""
     try:
-        intent = parse_intent(message)
-        action = intent.get("action", "unknown")
-        brief = intent.get("content_brief", message)
+        structured_action = (body.action or "").strip().lower()
+        uses_structured_path = bool(structured_action)
+
+        if uses_structured_path:
+            if structured_action not in {"post", "comment"}:
+                tasks[task_id].update({
+                    "status": "error",
+                    "error": "Unsupported action. Use 'post' or 'comment'.",
+                })
+                return
+
+            brief = (body.content_brief or body.message or "").strip()
+            if not brief:
+                tasks[task_id].update({
+                    "status": "error",
+                    "error": "Please provide content for the draft.",
+                })
+                return
+
+            target_url = _normalize_facebook_url(body.target_url)
+            if structured_action == "comment" and not target_url:
+                tasks[task_id].update({
+                    "status": "error",
+                    "error": "Comment requests must include a valid Facebook post URL.",
+                })
+                return
+
+            intent = {
+                "action": structured_action,
+                "target_url": target_url,
+                "content_brief": brief,
+            }
+            action = structured_action
+        else:
+            message = (body.message or "").strip()
+            if not message:
+                tasks[task_id].update({
+                    "status": "error",
+                    "error": "Message is required.",
+                })
+                return
+
+            intent = parse_intent(message)
+            action = intent.get("action", "unknown")
+            brief = intent.get("content_brief", message)
+
+            if action == "comment":
+                normalized_url = _normalize_facebook_url(intent.get("target_url"))
+                if not normalized_url:
+                    tasks[task_id].update({
+                        "status": "error",
+                        "error": "Comment requests must include a valid Facebook post URL.",
+                    })
+                    return
+                intent["target_url"] = normalized_url
 
         if action == "unknown":
             tasks[task_id].update({
@@ -268,6 +345,7 @@ async def create_draft(task_id: str, message: str):
             "generated_content": content,
             "action": action,
             "intent": intent,
+            "target_url": intent.get("target_url"),
         })
     except Exception as e:
         logger.exception("Draft %s failed", task_id)
@@ -320,3 +398,31 @@ def _user_facing_error(e: Exception) -> str:
     if msg:
         return f"{name}: {msg[:200]}"
     return f"{name} (see backend logs for details)."
+
+
+def _normalize_facebook_url(url: str | None) -> str | None:
+    """Normalize and validate a URL that must point to Facebook."""
+    if not url:
+        return None
+
+    candidate = url.strip()
+    if not candidate:
+        return None
+    if not candidate.startswith(("http://", "https://")):
+        candidate = f"https://{candidate}"
+
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return None
+
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or not host:
+        return None
+
+    is_facebook = host == "facebook.com" or host.endswith(".facebook.com")
+    is_fb_watch = host == "fb.watch" or host.endswith(".fb.watch")
+    if not (is_facebook or is_fb_watch):
+        return None
+
+    return candidate

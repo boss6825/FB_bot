@@ -5,7 +5,7 @@ import {
 
 const QUICK_ACTIONS = [
   'Post about AI trends on Facebook',
-  'Comment on the latest tech post',
+  'Comment on https://www.facebook.com/zuck/posts/10102577175875681 saying Great insight, thanks for sharing.',
   'Post a company update',
 ]
 
@@ -16,6 +16,24 @@ const STATUS_CONFIG = {
   publishing: { color: 'var(--primary)', bg: 'var(--primary-light)', label: 'Publishing', Icon: IconLoader },
   done: { color: 'var(--success)', bg: 'var(--success-light)', label: 'Completed', Icon: IconCheck },
   error: { color: 'var(--error)', bg: 'var(--error-light)', label: 'Failed', Icon: IconAlertCircle },
+}
+
+function normalizeFacebookUrl(raw) {
+  const text = (raw || '').trim()
+  if (!text) return null
+
+  let value = text
+  if (!/^https?:\/\//i.test(value)) value = `https://${value}`
+
+  try {
+    const parsed = new URL(value)
+    const host = parsed.hostname.toLowerCase()
+    const isFacebook = host === 'facebook.com' || host.endsWith('.facebook.com')
+    const isFbWatch = host === 'fb.watch' || host.endsWith('.fb.watch')
+    return isFacebook || isFbWatch ? parsed.toString() : null
+  } catch {
+    return null
+  }
 }
 
 function ThinkingDots() {
@@ -104,7 +122,9 @@ function TaskStatusCard({ task }) {
       )}
       {task.status === 'publishing' && (
         <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
-          Posting to Facebook via browser automation...
+          {task.action === 'comment'
+            ? 'Posting comment to Facebook via browser automation...'
+            : 'Posting to Facebook via browser automation...'}
         </p>
       )}
       {task.status === 'running' && (
@@ -407,8 +427,8 @@ function WelcomeMessage({ onPickPrompt }) {
           lineHeight: 1.6,
         }}
       >
-        Type a natural-language command to post or comment on Facebook. I'll generate a draft
-        for you to review before publishing.
+        Send a post command or switch to Comment mode to target a specific Facebook post link.
+        Drafts are always generated for review before publishing.
       </p>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center', marginTop: 8 }}>
         {QUICK_ACTIONS.map((cmd, i) => (
@@ -452,7 +472,11 @@ export default function ChatView({
   onPublishDraft,
   onCancelDraft,
 }) {
+  const [composeMode, setComposeMode] = useState('command')
   const [inputValue, setInputValue] = useState('')
+  const [commentUrl, setCommentUrl] = useState('')
+  const [commentPrompt, setCommentPrompt] = useState('')
+  const [urlError, setUrlError] = useState('')
   const messagesScrollRef = useRef(null)
   const inputRef = useRef(null)
 
@@ -462,8 +486,32 @@ export default function ChatView({
   }, [messages])
 
   const handleSend = () => {
+    if (isSending) return
+
+    if (composeMode === 'comment') {
+      const brief = commentPrompt.trim()
+      if (!brief) return
+
+      const normalizedUrl = normalizeFacebookUrl(commentUrl)
+      if (!normalizedUrl) {
+        setUrlError('Enter a valid Facebook post URL from facebook.com or fb.watch.')
+        return
+      }
+
+      setUrlError('')
+      onSendMessage({
+        mode: 'comment',
+        targetUrl: normalizedUrl,
+        contentBrief: brief,
+        messagePreview: `Comment on ${normalizedUrl} saying: ${brief}`,
+      })
+      setCommentUrl('')
+      setCommentPrompt('')
+      return
+    }
+
     const msg = inputValue.trim()
-    if (!msg || isSending) return
+    if (!msg) return
     setInputValue('')
     onSendMessage(msg)
   }
@@ -476,6 +524,7 @@ export default function ChatView({
   }
 
   const pickPrompt = (cmd) => {
+    setComposeMode('command')
     setInputValue(cmd)
     setTimeout(() => inputRef.current?.focus(), 50)
   }
@@ -512,32 +561,101 @@ export default function ChatView({
       </div>
 
       <div style={styles.inputArea}>
-        <div style={styles.inputWrap}>
-          <input
-            ref={inputRef}
-            type="text"
-            value={inputValue}
-            onChange={(e) => setInputValue(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Type a command... e.g. 'post about AI trends'"
-            style={styles.input}
-            disabled={isSending}
-          />
+        <div style={styles.modeSwitch}>
           <button
-            onClick={handleSend}
-            disabled={!inputValue.trim() || isSending}
+            onClick={() => setComposeMode('command')}
             style={{
-              ...styles.sendBtn,
-              opacity: inputValue.trim() && !isSending ? 1 : 0.4,
-              cursor: !inputValue.trim() || isSending ? 'not-allowed' : 'pointer',
+              ...styles.modeBtn,
+              ...(composeMode === 'command' ? styles.modeBtnActive : {}),
             }}
-            aria-label="Send"
+            type="button"
           >
-            {isSending ? <IconLoader size={18} /> : <IconSend size={18} />}
+            Command
+          </button>
+          <button
+            onClick={() => setComposeMode('comment')}
+            style={{
+              ...styles.modeBtn,
+              ...(composeMode === 'comment' ? styles.modeBtnActive : {}),
+            }}
+            type="button"
+          >
+            Comment by Link
           </button>
         </div>
+
+        {composeMode === 'comment' ? (
+          <div style={styles.commentWrap}>
+            <input
+              type="text"
+              value={commentUrl}
+              onChange={(e) => {
+                setCommentUrl(e.target.value)
+                if (urlError) setUrlError('')
+              }}
+              placeholder="Facebook post URL (required)"
+              style={{
+                ...styles.input,
+                ...(urlError ? styles.inputError : {}),
+              }}
+              disabled={isSending}
+            />
+            <div style={styles.commentPromptRow}>
+              <input
+                type="text"
+                value={commentPrompt}
+                onChange={(e) => setCommentPrompt(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="What should the comment say?"
+                style={styles.input}
+                disabled={isSending}
+              />
+              <button
+                onClick={handleSend}
+                disabled={!commentPrompt.trim() || !commentUrl.trim() || isSending}
+                style={{
+                  ...styles.sendBtn,
+                  opacity: commentPrompt.trim() && commentUrl.trim() && !isSending ? 1 : 0.4,
+                  cursor:
+                    !commentPrompt.trim() || !commentUrl.trim() || isSending
+                      ? 'not-allowed'
+                      : 'pointer',
+                }}
+                aria-label="Send comment task"
+              >
+                {isSending ? <IconLoader size={18} /> : <IconSend size={18} />}
+              </button>
+            </div>
+            {urlError && <div style={styles.errorText}>{urlError}</div>}
+          </div>
+        ) : (
+          <div style={styles.inputWrap}>
+            <input
+              ref={inputRef}
+              type="text"
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="Type a command... e.g. 'post about AI trends'"
+              style={styles.input}
+              disabled={isSending}
+            />
+            <button
+              onClick={handleSend}
+              disabled={!inputValue.trim() || isSending}
+              style={{
+                ...styles.sendBtn,
+                opacity: inputValue.trim() && !isSending ? 1 : 0.4,
+                cursor: !inputValue.trim() || isSending ? 'not-allowed' : 'pointer',
+              }}
+              aria-label="Send"
+            >
+              {isSending ? <IconLoader size={18} /> : <IconSend size={18} />}
+            </button>
+          </div>
+        )}
         <div style={styles.inputHint}>
-          <span>Enter</span> to send &nbsp;·&nbsp; <span>Shift+Enter</span> for new line
+          <span>Enter</span> to send
         </div>
       </div>
     </div>
@@ -585,6 +703,27 @@ const styles = {
     background: '#fff',
     flexShrink: 0,
   },
+  modeSwitch: {
+    display: 'flex',
+    gap: 8,
+    maxWidth: 680,
+    margin: '0 auto 10px',
+  },
+  modeBtn: {
+    padding: '6px 12px',
+    borderRadius: 999,
+    border: '1px solid var(--border)',
+    background: '#fff',
+    fontSize: 12,
+    fontWeight: 600,
+    color: 'var(--text-secondary)',
+    cursor: 'pointer',
+  },
+  modeBtnActive: {
+    borderColor: 'var(--primary)',
+    background: 'var(--primary-light)',
+    color: 'var(--primary-text)',
+  },
   inputWrap: {
     display: 'flex',
     alignItems: 'center',
@@ -597,6 +736,22 @@ const styles = {
     margin: '0 auto',
     transition: 'border-color 200ms',
   },
+  commentWrap: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 8,
+    background: 'var(--bg-alt)',
+    border: '1.5px solid var(--border)',
+    borderRadius: 14,
+    padding: '10px 12px',
+    maxWidth: 680,
+    margin: '0 auto',
+  },
+  commentPromptRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+  },
   input: {
     flex: 1,
     border: 'none',
@@ -605,6 +760,9 @@ const styles = {
     outline: 'none',
     color: 'var(--text)',
     padding: '8px 0',
+  },
+  inputError: {
+    color: '#B91C1C',
   },
   sendBtn: {
     width: 40,
@@ -624,5 +782,10 @@ const styles = {
     fontSize: 11,
     color: 'var(--text-muted)',
     marginTop: 8,
+  },
+  errorText: {
+    fontSize: 12,
+    color: '#B91C1C',
+    marginTop: 2,
   },
 }

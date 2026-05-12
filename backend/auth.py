@@ -70,3 +70,9 @@ def credentials_exist() -> bool:
 def credentials_valid() -> bool:
     """Return True only when credentials file exists and can be decrypted/parsed."""
     return load_credentials() is not None
+
+
+def clear_credentials() -> None:
+    """Delete encrypted credentials from disk."""
+    if CREDENTIALS_FILE.exists():
+        CREDENTIALS_FILE.unlink()

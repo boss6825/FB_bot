@@ -10,6 +10,7 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
   const [showPassword, setShowPassword] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [success, setSuccess] = useState('')
   const [loggingOut, setLoggingOut] = useState(false)
 
   async function handleSave() {
@@ -19,6 +20,7 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
     }
     setSaving(true)
     setError('')
+    setSuccess('')
     try {
       await api.saveCredentials(email.trim(), password.trim())
       onSave()
@@ -31,9 +33,12 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
 
   async function handleLogout() {
     setLoggingOut(true)
+    setError('')
+    setSuccess('')
     try {
       await api.logout()
-      onLogout()
+      setSuccess('Credentials removed successfully. You can connect another account now.')
+      await onLogout?.()
     } catch (e) {
       setError(e.message || 'Failed to logout')
     } finally {
@@ -76,6 +81,12 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
               <div style={styles.error}>
                 <IconAlertCircle size={14} />
                 {error}
+              </div>
+            )}
+            {success && (
+              <div style={styles.success}>
+                <IconCheck size={14} />
+                {success}
               </div>
             )}
           </div>
@@ -124,6 +135,12 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
               <div style={styles.error}>
                 <IconAlertCircle size={14} />
                 {error}
+              </div>
+            )}
+            {success && (
+              <div style={styles.success}>
+                <IconCheck size={14} />
+                {success}
               </div>
             )}
 
@@ -230,6 +247,17 @@ const styles = {
     padding: '8px 12px',
     background: 'var(--error-light)',
     borderRadius: 8,
+  },
+  success: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    fontSize: 13,
+    color: '#065F46',
+    padding: '8px 12px',
+    background: 'var(--success-light)',
+    borderRadius: 8,
+    border: '1px solid #D1FAE5',
   },
   saveBtn: {
     padding: '11px 20px',

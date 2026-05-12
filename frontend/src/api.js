@@ -24,11 +24,16 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ message, task_id: taskId }),
     }),
-  createDraft: (message, taskId) =>
-    jsonFetch('/draft', {
+  createDraft: (payloadOrMessage, taskId) => {
+    const payload =
+      typeof payloadOrMessage === 'string'
+        ? { message: payloadOrMessage, task_id: taskId }
+        : payloadOrMessage
+    return jsonFetch('/draft', {
       method: 'POST',
-      body: JSON.stringify({ message, task_id: taskId }),
-    }),
+      body: JSON.stringify(payload),
+    })
+  },
   publishDraft: (draftId, text) =>
     jsonFetch(`/draft/${draftId}/publish`, {
       method: 'POST',

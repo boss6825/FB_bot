@@ -116,10 +116,17 @@ export default function App() {
 
   // ── Send command → create draft ──────────────────────────────────
   const handleSendMessage = useCallback(
-    async (text) => {
+    async (payload) => {
       if (isSending) return
 
-      pushMessage({ type: 'user', content: text })
+      const isStructured = typeof payload === 'object' && payload !== null
+      const text = isStructured ? payload.messagePreview || payload.contentBrief || '' : payload
+      const commandText =
+        isStructured && payload.mode === 'comment'
+          ? `Comment on ${payload.targetUrl} saying: ${payload.contentBrief}`
+          : text
+
+      pushMessage({ type: 'user', content: commandText })
 
       if (!backendConnected) {
         pushMessage({
@@ -142,14 +149,28 @@ export default function App() {
       setIsSending(true)
 
       const taskId = uuid()
+      const draftPayload =
+        isStructured && payload.mode === 'comment'
+          ? {
+              task_id: taskId,
+              action: 'comment',
+              target_url: payload.targetUrl,
+              content_brief: payload.contentBrief,
+              message: payload.messagePreview,
+            }
+          : {
+              task_id: taskId,
+              message: text,
+            }
+
       upsertTask(taskId, {
-        command: text,
+        command: commandText,
         status: 'processing',
         timestamp: Date.now(),
       })
 
       try {
-        await api.createDraft(text, taskId)
+        await api.createDraft(draftPayload)
         const result = await pollUntil(taskId, ['draft', 'error'])
 
         if (result.status === 'error') {
@@ -160,7 +181,7 @@ export default function App() {
             task: {
               id: taskId,
               status: 'error',
-              command: text,
+              command: commandText,
               error: errMsg,
             },
           })
@@ -363,9 +384,9 @@ export default function App() {
             setShowCredModal(false)
             checkBackend()
           }}
-          onLogout={() => {
+          onLogout={async () => {
             setIsSetup(false)
-            checkBackend()
+            await checkBackend()
           }}
         />
       )}
