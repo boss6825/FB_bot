@@ -48,6 +48,10 @@ class ChatRequest(BaseModel):
     task_id: str  # client generates this (e.g. uuid)
 
 
+class PublishDraftRequest(BaseModel):
+    text: str
+
+
 # ── Routes ───────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -113,6 +117,52 @@ def get_task_status(task_id: str):
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found.")
     return tasks[task_id]
+
+
+@app.post("/draft")
+async def create_draft_endpoint(body: ChatRequest, background_tasks: BackgroundTasks):
+    """
+    Parse intent and generate post/comment text — but do NOT run the browser yet.
+    Returns immediately; poll /task/{task_id} until status == 'draft'.
+    """
+    if not credentials_exist():
+        raise HTTPException(status_code=400, detail="No Facebook credentials saved. Please set up credentials first.")
+    if not credentials_valid():
+        raise HTTPException(status_code=400, detail="Saved credentials are unreadable/invalid. Please save credentials again.")
+
+    tasks[body.task_id] = {
+        "status": "processing",
+        "result": None,
+        "error": None,
+        "generated_content": None,
+        "action": None,
+        "intent": None,
+    }
+    background_tasks.add_task(create_draft, body.task_id, body.message)
+    return {"task_id": body.task_id, "status": "processing"}
+
+
+@app.post("/draft/{draft_id}/publish")
+async def publish_draft(draft_id: str, body: PublishDraftRequest, background_tasks: BackgroundTasks):
+    """
+    Take user-confirmed (and optionally edited) text and run the browser agent.
+    Poll /task/{draft_id} until status == 'done' or 'error'.
+    """
+    if draft_id not in tasks:
+        raise HTTPException(status_code=404, detail="Draft not found.")
+    task = tasks[draft_id]
+    if task.get("status") != "draft":
+        raise HTTPException(status_code=400, detail=f"Task is not in draft state (current status: {task.get('status')}).")
+
+    intent = task.get("intent") or {}
+    action = task.get("action", "post")
+    target_url = intent.get("target_url")
+
+    tasks[draft_id]["status"] = "publishing"
+    tasks[draft_id]["edited_text"] = body.text
+
+    background_tasks.add_task(publish_task, draft_id, body.text, action, target_url)
+    return {"task_id": draft_id, "status": "publishing"}
 
 
 # ── Background task runner ────────────────────────────────────────
@@ -195,6 +245,68 @@ async def run_task(task_id: str, message: str):
             "result": None,
             "error": _user_facing_error(e),
         }
+
+
+async def create_draft(task_id: str, message: str):
+    """Parse intent and generate text; stop before browser automation."""
+    try:
+        intent = parse_intent(message)
+        action = intent.get("action", "unknown")
+        brief = intent.get("content_brief", message)
+
+        if action == "unknown":
+            tasks[task_id].update({
+                "status": "error",
+                "error": "I couldn't understand what you want to do on Facebook. Try something like 'post about X'.",
+            })
+            return
+
+        content = generate_post_text(brief) if action == "post" else generate_comment_text(brief)
+
+        tasks[task_id].update({
+            "status": "draft",
+            "generated_content": content,
+            "action": action,
+            "intent": intent,
+        })
+    except Exception as e:
+        logger.exception("Draft %s failed", task_id)
+        tasks[task_id].update({
+            "status": "error",
+            "error": _user_facing_error(e),
+        })
+
+
+async def publish_task(task_id: str, content: str, action: str, target_url: str | None):
+    """Build agent task string and run browser automation with user-confirmed text."""
+    try:
+        agent_task = build_agent_task(action, content, target_url)
+
+        from agent import run_fb_task
+
+        def _run_in_thread() -> str:
+            if sys.platform == "win32":
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(run_fb_task(agent_task))
+            finally:
+                loop.close()
+
+        result = await asyncio.to_thread(_run_in_thread)
+        failure_prefixes = ("Login failed", "Agent failed", "Agent stopped")
+        is_failure = any(result.startswith(p) for p in failure_prefixes)
+
+        if is_failure:
+            tasks[task_id].update({"status": "error", "result": None, "error": result})
+            return
+
+        tasks[task_id].update({"status": "done", "result": result, "error": None})
+
+    except Exception as e:
+        logger.exception("Publish task %s failed", task_id)
+        tasks[task_id].update({"status": "error", "result": None, "error": _user_facing_error(e)})
 
 
 def _user_facing_error(e: Exception) -> str:

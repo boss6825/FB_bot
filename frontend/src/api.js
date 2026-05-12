@@ -23,6 +23,16 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ message, task_id: taskId }),
     }),
+  createDraft: (message, taskId) =>
+    jsonFetch('/draft', {
+      method: 'POST',
+      body: JSON.stringify({ message, task_id: taskId }),
+    }),
+  publishDraft: (draftId, text) =>
+    jsonFetch(`/draft/${draftId}/publish`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    }),
   getTask: (taskId) => jsonFetch(`/task/${taskId}`),
 }
 

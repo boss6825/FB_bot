@@ -14,18 +14,16 @@ export default function App() {
   ])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
+  const [draft, setDraft] = useState(null)   // { id, action } | null
+  const [draftText, setDraftText] = useState('')
   const chatEndRef = useRef(null)
 
-  // Initial setup check
-  useEffect(() => {
-    refreshSetup()
-  }, [])
+  useEffect(() => { refreshSetup() }, [])
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  }, [messages, draft])
 
-  // Auto-open credentials modal if not configured
   useEffect(() => {
     if (!setup.credentials_saved) setShowCreds(true)
   }, [setup.credentials_saved])
@@ -43,13 +41,12 @@ export default function App() {
     setMessages((prev) => [...prev, m])
   }
 
-  async function pollTask(taskId) {
+  async function pollUntil(taskId, ...terminalStatuses) {
     while (true) {
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS))
       try {
         const data = await api.getTask(taskId)
-        if (data.status === 'done') return data
-        if (data.status === 'error') return data
+        if (terminalStatuses.includes(data.status)) return data
       } catch (e) {
         return { status: 'error', error: e.message }
       }
@@ -69,34 +66,89 @@ export default function App() {
     setBusy(true)
 
     const taskId = uuid()
-    pushMsg({ role: 'bot', text: 'Working on it', pending: true, taskId })
+    pushMsg({ role: 'bot', text: 'Generating draft', pending: true, taskId })
 
     try {
-      await api.sendChat(text, taskId)
-      const result = await pollTask(taskId)
+      await api.createDraft(text, taskId)
+      const result = await pollUntil(taskId, 'draft', 'error')
+
+      if (result.status === 'error') {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.taskId === taskId
+              ? { role: 'error', text: `Failed: ${result.error || 'unknown error'}` }
+              : m
+          )
+        )
+        setBusy(false)
+        return
+      }
+
+      // Draft ready — replace spinner with prompt, show review panel
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.taskId === taskId
+            ? { role: 'bot', text: "Here's your draft — edit if needed, then publish:" }
+            : m
+        )
+      )
+      setDraft({ id: taskId, action: result.action })
+      setDraftText(result.generated_content || '')
+    } catch (e) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.taskId === taskId ? { role: 'error', text: `Error: ${e.message}` } : m
+        )
+      )
+      setBusy(false)
+    }
+  }
+
+  async function handlePublish() {
+    const finalText = draftText.trim()
+    if (!finalText || !draft) return
+
+    const { id: draftId, action } = draft
+    setDraft(null)
+
+    const pubTaskId = uuid()
+    pushMsg({ role: 'bot', text: 'Publishing', pending: true, taskId: pubTaskId })
+
+    try {
+      await api.publishDraft(draftId, finalText)
+      const result = await pollUntil(draftId, 'done', 'error')
 
       setMessages((prev) =>
         prev.map((m) => {
-          if (m.taskId !== taskId) return m
+          if (m.taskId !== pubTaskId) return m
           if (result.status === 'error') {
             return { role: 'error', text: `Failed: ${result.error || 'unknown error'}` }
           }
           return {
             role: 'bot',
-            text: result.result || 'Task complete.',
-            generated: result.generated_content,
-            action: result.action,
+            text: result.result || 'Posted!',
+            generated: finalText,
+            action,
           }
         })
       )
     } catch (e) {
       setMessages((prev) =>
-        prev.map((m) => (m.taskId === taskId ? { role: 'error', text: `Error: ${e.message}` } : m))
+        prev.map((m) =>
+          m.taskId === pubTaskId ? { role: 'error', text: `Error: ${e.message}` } : m
+        )
       )
     } finally {
       setBusy(false)
       refreshSetup()
     }
+  }
+
+  function handleCancelDraft() {
+    setDraft(null)
+    setDraftText('')
+    pushMsg({ role: 'bot', text: 'Draft cancelled. You can try a different topic.' })
+    setBusy(false)
   }
 
   async function handleLogout() {
@@ -143,7 +195,7 @@ export default function App() {
             )}
             {m.generated && (
               <div className="gen">
-                <strong>Generated {m.action}:</strong>
+                <strong>Published {m.action}:</strong>
                 <br />
                 {m.generated}
               </div>
@@ -153,19 +205,40 @@ export default function App() {
         <div ref={chatEndRef} />
       </div>
 
-      <div className="input-row">
-        <input
-          type="text"
-          placeholder='e.g. "post about AI changing sales"'
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-          disabled={busy}
-        />
-        <button onClick={handleSend} disabled={busy || !input.trim()}>
-          {busy ? 'Working' : 'Send'}
-        </button>
-      </div>
+      {draft ? (
+        <div className="draft-panel">
+          <label>Review &amp; edit before publishing:</label>
+          <textarea
+            value={draftText}
+            onChange={(e) => setDraftText(e.target.value)}
+            rows={5}
+            autoFocus
+          />
+          <div className="draft-footer">
+            <span className="char-count">{draftText.length} chars</span>
+            <div className="draft-actions">
+              <button className="ghost" onClick={handleCancelDraft}>Cancel</button>
+              <button onClick={handlePublish} disabled={!draftText.trim()}>
+                Publish
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="input-row">
+          <input
+            type="text"
+            placeholder='e.g. "post about AI changing sales"'
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+            disabled={busy}
+          />
+          <button onClick={handleSend} disabled={busy || !input.trim()}>
+            {busy ? 'Working' : 'Send'}
+          </button>
+        </div>
+      )}
 
       {showCreds && (
         <CredentialsModal

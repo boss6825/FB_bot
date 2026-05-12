@@ -2,6 +2,36 @@
 
 AI-powered Facebook automation agent. Natural language in → posts/comments out.
 
+## Run Frontend + Backend Separately (Windows Git Bash)
+
+Open two Git Bash terminals.
+
+### Terminal 1: Backend
+
+```bash
+cd backend
+
+# Activate venv (Windows Git Bash)
+source venv/Scripts/activate
+
+# If venv does not exist yet:
+# python -m venv venv
+# source venv/Scripts/activate
+
+uvicorn main:app --reload --port 8000
+```
+
+### Terminal 2: Frontend
+
+```bash
+cd frontend
+
+# If dependencies are not installed yet:
+# npm install
+
+npm run dev
+```
+
 ## Setup
 
 ```bash

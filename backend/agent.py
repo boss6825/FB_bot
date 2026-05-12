@@ -32,11 +32,29 @@ def _build_task(task_description: str, has_session: bool) -> str:
     substitutes the real values only when typing into the page — the LLM never sees
     the actual email/password.
     """
+    efficiency_rules = (
+        "EFFICIENCY RULES (critical — follow strictly):\n"
+        "- Return MULTIPLE actions in a single response whenever the next steps are "
+        "predictable from the current screen. Do not stop after each action.\n"
+        "- On the Facebook login page, emit ONE response containing all three actions: "
+        "type `fb_email` into the email field, type `fb_password` into the password field, "
+        "then click the Log In button. Do not split this across separate responses.\n"
+        "- For the composer flow, emit ONE response containing: click the 'What's on your "
+        "mind' opener, type the post text, then click Post. Do not split.\n"
+        "- Only break the batch if you actually need to read new page state (e.g. a "
+        "checkpoint, 2FA, or unexpected dialog appears).\n"
+        "- DONE CONDITION: the moment the requested action is visibly performed (post "
+        "appears in feed, message sent, comment submitted, etc.), call the `done` tool "
+        "immediately with success=true. Do not keep verifying or navigating.\n"
+        "- If the composer is already open and the Post button is enabled, click Post "
+        "immediately and finish.\n"
+    )
+
     login_block = (
-        "If a login screen, checkpoint, or any sign-in prompt appears, log in with "
-        "email `fb_email` and password `fb_password`: type the email into the email "
-        "field, the password into the password field, then click the login button. "
-        "Wait for the Facebook home feed to load before continuing with the task."
+        "If a login screen, checkpoint, or any sign-in prompt appears, log in in a single "
+        "batched response: type `fb_email` into the email field, type `fb_password` into "
+        "the password field, and click the Log In button — all three actions in ONE model "
+        "response. Then wait for the Facebook home feed to load before continuing."
     )
 
     if has_session:
@@ -53,7 +71,7 @@ def _build_task(task_description: str, has_session: bool) -> str:
             "Once logged in, perform the task below.\n"
         )
 
-    return f"{preface}\nTask:\n{task_description}"
+    return f"{preface}\n{efficiency_rules}\nTask:\n{task_description}"
 
 
 async def run_fb_task(task_description: str) -> str:
@@ -91,9 +109,10 @@ async def run_fb_task(task_description: str) -> str:
             use_thinking=False,
             flash_mode=True,
             enable_planning=False,
+            max_actions_per_step=10,
         )
 
-        history = await agent.run(max_steps=25)
+        history = await agent.run(max_steps=35)
         final_result = history.final_result()
 
         if history.has_errors() and not history.is_done():
