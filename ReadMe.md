@@ -106,15 +106,41 @@ curl -X POST http://localhost:8000/draft/draft-1/publish \
 
 ## Architecture
 
+The default flow is **draft-first**: Claude writes the text, the user reviews/edits it in the
+chat UI, and only then does the browser agent run. The legacy one-shot `/chat` route is still
+available but not used by the React frontend.
+
 ```
-User message
-    → FastAPI /chat
-        → Claude parses intent (post vs comment)
-        → Claude generates post/comment text
-        → browser-use Agent executes on Facebook
-            → Playwright saves session cookies
-    → Poll /task/{id} for result
+One-time setup
+    User → CredentialModal → POST /auth/credentials
+        → Fernet (AES-128) → backend/storage/credentials.enc
+
+Per-command flow (draft-first)
+    React ChatView
+        → POST /draft  { task_id, message | action+target_url+content_brief }
+            → parse_intent          (Claude → action / url / brief)
+            → generate_post_text or generate_comment_text  (Claude)
+        → status: "draft"  with generated_content
+    Frontend polls GET /task/{id} → renders Draft card
+    User edits + approves
+        → POST /draft/{id}/publish  { text }
+            → build_agent_task(action, text, url)
+            → run_fb_task()  — browser-use Agent + Playwright
+                · loads fb_session.json (re-uses cookies)
+                · if expired: re-logs in with decrypted creds
+                  via sensitive_data placeholders (LLM never
+                  sees raw email/password)
+                · posts / comments on Facebook
+                · deterministic JS fallback click for Post /
+                  Comment if agent stops before "done"
+                · saves updated storage_state back to disk
+        → status: "done" | "error"
+    Frontend polls GET /task/{id} → renders result in chat
 ```
+
+Frontend pages: **Chat** (drafts + publish), **Dashboard** (per-task stats from
+`localStorage`), **History** (past tasks). Backend health + setup status are polled
+every 30s so the credential modal can prompt for re-login when needed.
 
 ## Session Management
 

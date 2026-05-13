@@ -4,7 +4,8 @@
       "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\arpit\\\\OneDrive\\\\Desktop\\\\projects\\\\2026\\\\FB_bot\" -Recurse -Force)",
       "Bash(Select-Object FullName)",
       "PowerShell(npm *)",
-      "Bash(curl *)"
+      "Bash(curl *)",
+      "mcp__claude_ai_Excalidraw__read_me"
     ]
   }
 }
