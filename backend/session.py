@@ -38,7 +38,7 @@ def clear_browser_profile() -> None:
     Remove persistent Playwright profile used by browser-use.
     This ensures account switch is clean even when keep-alive profile exists.
     """
-    default_profile_dir = Path(__file__).parent / "storage" / "tmp-browser-use-profile"
+    default_profile_dir = Path(__file__).parent / "storage" / "persistent-profile"
     configured_dir = os.getenv("BROWSER_USER_DATA_DIR", str(default_profile_dir))
     profile_dir = Path(configured_dir)
 
