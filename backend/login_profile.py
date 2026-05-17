@@ -35,7 +35,7 @@ async def main() -> None:
         await page.goto(FB_URL, wait_until="domcontentloaded")
 
         print()
-        print(f"Opened Facebook with profile: {BROWSER_USER_DATA_DIR}")
+        print(f"Opened Facebook with profile: {PROFILE_DIR}")
         print("Log in manually, complete any checkpoint/CAPTCHA, and wait until the feed is visible.")
         await asyncio.to_thread(input, "Press Enter here after Facebook is fully logged in...")
 

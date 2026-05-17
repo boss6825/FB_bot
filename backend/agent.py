@@ -10,7 +10,12 @@ from dotenv import load_dotenv
 
 from session import SESSION_FILE, load_session, save_session
 from auth import load_credentials
-from config import ANTHROPIC_MODEL, BROWSER_CHANNEL, BROWSER_USER_AGENT
+from config import (
+    ANTHROPIC_MODEL,
+    BROWSER_CHANNEL,
+    BROWSER_USER_AGENT,
+    BROWSER_USER_DATA_DIR,
+)
 
 ENV_FILE = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=ENV_FILE)
@@ -20,10 +25,6 @@ logger = logging.getLogger("fb_agent.agent")
 FB_URL = "https://www.facebook.com"
 BROWSER_HEADLESS = os.getenv("BROWSER_HEADLESS", "false").strip().lower() in {"1", "true", "yes", "on"}
 BROWSER_KEEP_OPEN = os.getenv("BROWSER_KEEP_OPEN", "false").strip().lower() in {"1", "true", "yes", "on"}
-BROWSER_USER_DATA_DIR = os.getenv(
-    "BROWSER_USER_DATA_DIR",
-    str(Path(__file__).parent / "storage" / "persistent-profile"),
-)
 
 POST_CLICK_FALLBACK_ATTEMPTS = 3
 POST_CLICK_FALLBACK_SLEEP_SECONDS = 1.2

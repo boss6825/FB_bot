@@ -1,7 +1,8 @@
 import json
-import os
 import shutil
 from pathlib import Path
+
+from config import BROWSER_USER_DATA_DIR
 
 STORAGE_DIR = Path(__file__).parent / "storage"
 STORAGE_DIR.mkdir(exist_ok=True)
@@ -38,9 +39,7 @@ def clear_browser_profile() -> None:
     Remove persistent Playwright profile used by browser-use.
     This ensures account switch is clean even when keep-alive profile exists.
     """
-    default_profile_dir = Path(__file__).parent / "storage" / "persistent-profile"
-    configured_dir = os.getenv("BROWSER_USER_DATA_DIR", str(default_profile_dir))
-    profile_dir = Path(configured_dir)
+    profile_dir = Path(BROWSER_USER_DATA_DIR)
 
     if profile_dir.exists() and profile_dir.is_dir():
         shutil.rmtree(profile_dir, ignore_errors=True)
