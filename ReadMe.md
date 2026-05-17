@@ -59,6 +59,8 @@ ANTHROPIC_API_KEY=your_key_here
 # BROWSER_HEADLESS=false
 # BROWSER_KEEP_OPEN=false
 # BROWSER_USER_DATA_DIR=backend/storage/tmp-browser-use-profile
+# BROWSER_CHANNEL=chrome
+# BROWSER_USER_AGENT=
 ```
 
 Start API server:
@@ -114,6 +116,8 @@ The backend reads environment variables from `backend/.env`.
 | `BROWSER_HEADLESS` | No | `false` | Browser visibility |
 | `BROWSER_KEEP_OPEN` | No | `false` | Keep browser session alive after task |
 | `BROWSER_USER_DATA_DIR` | No | `backend/storage/tmp-browser-use-profile` | Persistent Playwright profile path |
+| `BROWSER_CHANNEL` | No | `chrome` | Browser to launch. `chrome` uses the real installed Chrome (lower automation fingerprint, fewer login captchas). Set to `chromium` to fall back to the Playwright-bundled build if Chrome isn't installed. |
+| `BROWSER_USER_AGENT` | No | - | Optional user-agent override. Empty = browser default. |
 
 ## Data and security
 

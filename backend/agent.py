@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 from session import SESSION_FILE, load_session, save_session
 from auth import load_credentials
-from config import ANTHROPIC_MODEL
+from config import ANTHROPIC_MODEL, BROWSER_CHANNEL, BROWSER_USER_AGENT
 
 ENV_FILE = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=ENV_FILE)
@@ -219,9 +219,9 @@ def _build_task(task_description: str, has_session: bool) -> str:
         "EFFICIENCY RULES (critical — follow strictly):\n"
         "- Return MULTIPLE actions in a single response whenever the next steps are "
         "predictable from the current screen. Do not stop after each action.\n"
-        "- On the Facebook login page, emit ONE response containing all three actions: "
-        "type `fb_email` into the email field, type `fb_password` into the password field, "
-        "then click the Log In button. Do not split this across separate responses.\n"
+        "- EXCEPTION — the Facebook login page: do NOT batch login. Type `fb_email`, then "
+        "`fb_password`, then click Log In as separate actions to avoid tripping bot "
+        "detection.\n"
         "- For the composer flow, emit ONE response containing: click the 'What's on your "
         "mind' opener, type the post text, then click Post. Do not split.\n"
         "- Only break the batch if you actually need to read new page state (e.g. a "
@@ -247,10 +247,12 @@ def _build_task(task_description: str, has_session: bool) -> str:
     )
 
     login_block = (
-        "If a login screen, checkpoint, or any sign-in prompt appears, log in in a single "
-        "batched response: type `fb_email` into the email field, type `fb_password` into "
-        "the password field, and click the Log In button — all three actions in ONE model "
-        "response. Then wait for the Facebook home feed to load before continuing."
+        "If a login screen, checkpoint, or any sign-in prompt appears, log in step by "
+        "step: type `fb_email` into the email field, then type `fb_password` into the "
+        "password field, then click the Log In button. Use separate actions for these "
+        "steps rather than one rushed batch. Then wait for the Facebook home feed to "
+        "load before continuing. If a captcha or identity check appears, stop and report "
+        "it — do not attempt to solve it."
     )
 
     if has_session:
@@ -283,12 +285,24 @@ async def run_fb_task(task_description: str) -> str:
     has_session = session_state is not None
 
     storage_state_arg = str(SESSION_FILE) if has_session else None
-    browser_session = BrowserSession(
-        storage_state=storage_state_arg,
-        user_data_dir=BROWSER_USER_DATA_DIR,
-        headless=BROWSER_HEADLESS,
-        keep_alive=BROWSER_KEEP_OPEN,
-    )
+
+    # Stealth hardening: launch real Chrome and strip the automation fingerprints
+    # (navigator.webdriver, the --enable-automation switch, the automation infobar)
+    # that Facebook uses to gate logins behind a captcha.
+    session_kwargs: dict[str, Any] = {
+        "storage_state": storage_state_arg,
+        "user_data_dir": BROWSER_USER_DATA_DIR,
+        "headless": BROWSER_HEADLESS,
+        "keep_alive": BROWSER_KEEP_OPEN,
+        "args": ["--disable-blink-features=AutomationControlled"],
+        "ignore_default_args": ["--enable-automation"],
+    }
+    if BROWSER_CHANNEL:
+        session_kwargs["channel"] = BROWSER_CHANNEL
+    if BROWSER_USER_AGENT:
+        session_kwargs["user_agent"] = BROWSER_USER_AGENT
+
+    browser_session = BrowserSession(**session_kwargs)
 
     llm = ChatAnthropic(model=ANTHROPIC_MODEL)
     full_task = _build_task(task_description, has_session=has_session)
