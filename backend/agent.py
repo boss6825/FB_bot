@@ -22,7 +22,7 @@ BROWSER_HEADLESS = os.getenv("BROWSER_HEADLESS", "false").strip().lower() in {"1
 BROWSER_KEEP_OPEN = os.getenv("BROWSER_KEEP_OPEN", "false").strip().lower() in {"1", "true", "yes", "on"}
 BROWSER_USER_DATA_DIR = os.getenv(
     "BROWSER_USER_DATA_DIR",
-    str(Path(__file__).parent / "storage" / "tmp-browser-use-profile"),
+    str(Path(__file__).parent / "storage" / "persistent-profile"),
 )
 
 POST_CLICK_FALLBACK_ATTEMPTS = 3

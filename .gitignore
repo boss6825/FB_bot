@@ -220,5 +220,7 @@ fb_session.json
 credentials.enc
 PROJECT_SUMMARY.md
 tmp-browser-use-profile
+backend/storage/persistent-profile/
+backend/storage/tasks.db
 backend/storage/fb_session.json.bak
 docs/flowchart.excalidraw

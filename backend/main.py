@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from auth import save_credentials, clear_credentials, credentials_exist, credentials_valid, load_credentials
 from session import session_exists, clear_session, clear_browser_profile
 from llm import parse_intent, generate_post_text, generate_comment_text, build_agent_task
+from store import TaskStore
 
 ENV_FILE = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=ENV_FILE)
@@ -32,9 +33,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory task store for status polling
-# key: task_id, value: { status, result, error }
-tasks: dict[str, dict] = {}
+# SQLite-backed task store for status polling.
+# key: task_id, value: { status, result, error, ... }
+tasks = TaskStore()
 
 
 # ── Request models ────────────────────────────────────────────────
