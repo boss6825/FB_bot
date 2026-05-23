@@ -17,6 +17,7 @@ from session import (
     clear_browser_profile,
     get_or_create_context_id,
     delete_context,
+    delete_context_by_id,
 )
 from llm import parse_intent, generate_post_text, generate_comment_text, build_agent_task
 from store import TaskStore
@@ -103,8 +104,6 @@ async def start_login():
         raise HTTPException(status_code=500, detail=_user_facing_error(e))
 
     _login_sessions[info["session_id"]] = {
-        "client": info["client"],
-        "session": info["session"],
         "context_id": context_id,
     }
 
@@ -117,7 +116,7 @@ async def start_login():
 
 @app.post("/auth/login/verify/{session_id}")
 async def verify_login(session_id: str):
-    """Check if the user has finished logging in on the given session."""
+    """User confirms login. Persist context + release session."""
     if session_id not in _login_sessions:
         raise HTTPException(status_code=404, detail="Login session not found or already ended.")
 
@@ -125,11 +124,11 @@ async def verify_login(session_id: str):
     from session import save_context_id
 
     info = _login_sessions[session_id]
-    result = await verify_login_session(info["client"], session_id)
+    result = await verify_login_session(session_id)
 
     if result["logged_in"]:
         save_context_id(info["context_id"])
-        await end_session(info["client"], info["session"])
+        await end_session(session_id)
         del _login_sessions[session_id]
         return {"status": "logged_in"}
 
@@ -149,23 +148,30 @@ async def cancel_login(session_id: str):
     from agent import end_session
 
     info = _login_sessions.pop(session_id)
-    await end_session(info["client"], info["session"])
+    await end_session(session_id)
+    if load_context_id() != info.get("context_id"):
+        await delete_context_by_id(info.get("context_id"))
     return {"message": "Login session cancelled."}
 
 
 @app.post("/auth/logout")
 async def logout():
     """Disconnect account: delete Browserbase context + clear local data."""
-    # End any active login sessions
     from agent import end_session as _end
+    pending_contexts = []
     for sid, info in list(_login_sessions.items()):
+        pending_contexts.append(info.get("context_id"))
         try:
-            await _end(info["client"], info["session"])
+            await _end(sid)
         except Exception:
             pass
     _login_sessions.clear()
 
+    saved_context_id = load_context_id()
     await delete_context()
+    for context_id in pending_contexts:
+        if context_id and context_id != saved_context_id:
+            await delete_context_by_id(context_id)
     return {"message": "Logged out successfully."}
 
 

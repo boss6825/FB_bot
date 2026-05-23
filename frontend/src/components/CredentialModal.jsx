@@ -174,7 +174,10 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
           {(phase === 'waiting' || phase === 'verifying') && (
             <>
               <div style={styles.banner}>
-                <span>Log into Facebook in the window below, then click <strong>I&apos;m Logged In</strong>.</span>
+                <span>
+                  Navigate to <strong>facebook.com</strong> in the URL bar below,
+                  log in (handle any OTP / 2FA), then click <strong>I&apos;m Logged In</strong>.
+                </span>
                 {sessionUrl && (
                   <a
                     href={sessionUrl}

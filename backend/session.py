@@ -56,7 +56,7 @@ def clear_context_file() -> None:
         CONTEXT_FILE.unlink()
 
 
-async def create_context() -> str:
+async def create_context(*, persist: bool = False) -> str:
     """Create a new Browserbase context via REST API. Returns context_id."""
     project_id = _project_id()
     if not project_id:
@@ -74,16 +74,15 @@ async def create_context() -> str:
         resp.raise_for_status()
         data = resp.json()
         context_id = data["id"]
-        save_context_id(context_id)
+        if persist:
+            save_context_id(context_id)
         logger.info("Created Browserbase context: %s", context_id)
         return context_id
 
 
-async def delete_context() -> None:
-    """Delete Browserbase context via API and clear local file."""
-    context_id = load_context_id()
+async def delete_context_by_id(context_id: str) -> None:
+    """Delete a Browserbase context by ID without touching local login state."""
     if not context_id:
-        clear_context_file()
         return
 
     try:
@@ -99,8 +98,75 @@ async def delete_context() -> None:
                 logger.info("Deleted Browserbase context: %s", context_id)
     except Exception:
         logger.warning("Failed to delete context %s via API", context_id, exc_info=True)
+
+
+async def delete_context() -> None:
+    """Delete Browserbase context via API and clear local file."""
+    context_id = load_context_id()
+    if not context_id:
+        clear_context_file()
+        return
+
+    try:
+        await delete_context_by_id(context_id)
+    except Exception:
+        logger.warning("Failed to delete context %s via API", context_id, exc_info=True)
     finally:
         clear_context_file()
+
+
+async def create_browserbase_session(
+    context_id: str,
+    keep_alive: bool = True,
+    timeout_seconds: int = 1800,
+) -> dict:
+    """Create a Browserbase session directly via REST API.
+
+    Bypasses Stagehand so the session lifecycle is fully under our control —
+    Stagehand's RPC otherwise releases sessions shortly after the start call
+    returns, which kills the embedded live view.
+    """
+    project_id = _project_id()
+    if not project_id:
+        raise ValueError("BROWSERBASE_PROJECT_ID is not set.")
+
+    payload = {
+        "projectId": project_id,
+        "keepAlive": keep_alive,
+        "timeout": timeout_seconds,
+        "browserSettings": {
+            "context": {"id": context_id, "persist": True},
+            "solveCaptchas": True,
+            "recordSession": True,
+        },
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{BB_API_BASE}/sessions",
+            headers=_bb_headers(),
+            json=payload,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def release_browserbase_session(session_id: str) -> None:
+    """Release a Browserbase session via REST API (PATCH status=REQUEST_RELEASE)."""
+    project_id = _project_id()
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{BB_API_BASE}/sessions/{session_id}",
+                headers=_bb_headers(),
+                json={"projectId": project_id, "status": "REQUEST_RELEASE"},
+            )
+            if resp.status_code not in (200, 204, 404):
+                logger.warning(
+                    "Release session %s returned %s: %s",
+                    session_id, resp.status_code, resp.text,
+                )
+    except Exception:
+        logger.warning("Failed to release session %s", session_id, exc_info=True)
 
 
 async def get_session_debug_urls(session_id: str) -> dict:
@@ -121,7 +187,12 @@ async def get_session_debug_urls(session_id: str) -> dict:
 
 
 async def get_or_create_context_id() -> str:
-    """Return existing context ID or create a new one."""
+    """Return saved context ID or create a pending login context.
+
+    New contexts are not persisted here. Persisting before the user completes
+    login makes /status/setup report "connected" while login is still pending,
+    which causes the frontend to leave the live Browserbase session early.
+    """
     ctx = load_context_id()
     if ctx:
         return ctx

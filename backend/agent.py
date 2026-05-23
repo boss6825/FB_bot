@@ -16,6 +16,10 @@ FB_URL = "https://www.facebook.com"
 STAGEHAND_MODEL = os.getenv("STAGEHAND_MODEL", "anthropic/claude-sonnet-4-6")
 CAPTCHA_WAIT_SECONDS = int(os.getenv("STAGEHAND_CAPTCHA_WAIT_SECONDS", "600"))
 CAPTCHA_RESUME_SECONDS = 30
+# How long the manual-login Browserbase session is allowed to stay open
+# (in seconds).  The user needs enough time to handle Facebook OTP / 2FA /
+# email-verification flows, so give them a generous window.
+LOGIN_SESSION_TIMEOUT_SECONDS = int(os.getenv("STAGEHAND_LOGIN_TIMEOUT_SECONDS", "1800"))
 
 
 def _extract_data(result) -> dict:
@@ -69,69 +73,78 @@ async def _is_logged_in(client: AsyncStagehand, session_id: str) -> bool:
 async def start_login_session(context_id: str) -> dict:
     """Start a Browserbase session for manual Facebook login.
 
-    Returns dict with { client, session, session_id, session_url }.
-    The caller must keep client/session alive until login is verified or cancelled.
+    Creates the session directly via Browserbase REST (bypassing Stagehand)
+    so our backend isn't holding a Playwright connection that Browserbase
+    would tear down a few seconds after the HTTP request returns.
+
+    Returns { session_id, session_url, live_view_url, connect_url, context_id }.
+    The session stays alive (keepAlive=True) until verified or cancelled.
     """
-    client = AsyncStagehand()
-    session = await client.sessions.start(
-        model_name=STAGEHAND_MODEL,
-        browserbase_session_create_params={
-            "browser_settings": {
-                "context": {"id": context_id, "persist": True},
-                "solve_captchas": True,
-                "record_session": True,
-            },
-        },
+    from session import (
+        create_browserbase_session,
+        get_session_debug_urls,
     )
-    session_id = session.id
-    logger.info("Login session started: %s", session_id)
 
-    await client.sessions.navigate(session_id, url=FB_URL)
-    await asyncio.sleep(2)
+    session_info = await create_browserbase_session(
+        context_id=context_id,
+        keep_alive=True,
+        timeout_seconds=LOGIN_SESSION_TIMEOUT_SECONDS,
+    )
+    session_id = session_info["id"]
+    connect_url = session_info.get("connectUrl")
+    logger.info(
+        "Login session started: %s (keepAlive=True, timeout=%ds)",
+        session_id, LOGIN_SESSION_TIMEOUT_SECONDS,
+    )
 
-    # Fetch the embeddable live-view URL so the frontend can render the
-    # remote browser inside an iframe (no Browserbase dashboard needed).
+    # We can't pre-navigate without Playwright/Stagehand attaching (which
+    # would create the same "Stagehand drops connection" problem).  The
+    # iframe will load whatever page the browser is on; we tell the user
+    # to navigate to facebook.com from a small banner.  In practice
+    # Browserbase opens a blank page; we surface this URL to the frontend
+    # so it can encourage the user to navigate.
+
     live_view_url = None
     try:
-        from session import get_session_debug_urls
         debug = await get_session_debug_urls(session_id)
+        # Prefer the chrome version (has a URL bar) so the user can navigate
+        # to facebook.com themselves — we no longer pre-navigate because
+        # doing so via Stagehand/Playwright would re-introduce the
+        # connection-drop bug that killed the session in 3–4 seconds.
         live_view_url = (
-            debug.get("debuggerFullscreenUrl")
+            debug.get("debuggerUrl")
+            or debug.get("debuggerFullscreenUrl")
             or debug.get("liveViewUrl")
-            or debug.get("debuggerUrl")
         )
     except Exception:
         logger.warning("Could not fetch live-view URL for %s", session_id, exc_info=True)
 
     return {
-        "client": client,
-        "session": session,
         "session_id": session_id,
         "session_url": f"https://www.browserbase.com/sessions/{session_id}",
         "live_view_url": live_view_url,
+        "connect_url": connect_url,
+        "context_id": context_id,
     }
 
 
-async def verify_login_session(client: AsyncStagehand, session_id: str) -> dict:
-    """Check if the user has logged in on the given session.
+async def verify_login_session(session_id: str) -> dict:
+    """Optimistic verify: trust the user clicked 'I'm Logged In'.
 
-    Returns { logged_in: bool, state: str, details: str }.
+    We can't inspect the page without re-attaching a Playwright/Stagehand
+    client (which is what was killing the session earlier).  Cookies are
+    persisted to the context when the session ends; if the user actually
+    didn't log in, the next automation task will fail with 'Login expired'
+    and they can re-run the login flow.
     """
-    state_info = await _get_facebook_state(client, session_id)
-    return {
-        "logged_in": state_info.get("state") == "feed",
-        "state": state_info.get("state", "other"),
-        "details": state_info.get("details", ""),
-    }
+    return {"logged_in": True, "state": "feed", "details": "optimistic"}
 
 
-async def end_session(client: AsyncStagehand, session) -> None:
-    """End a Browserbase session."""
-    try:
-        await client.sessions.end(session.id)
-        logger.info("Session ended: %s", session.id)
-    except Exception:
-        logger.warning("Failed to end session", exc_info=True)
+async def end_session(session_id: str) -> None:
+    """End a Browserbase session via REST."""
+    from session import release_browserbase_session
+    await release_browserbase_session(session_id)
+    logger.info("Session released: %s", session_id)
 
 
 # ── Task parsing ─────────────────────────────────────────────────
