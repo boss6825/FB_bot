@@ -55,7 +55,7 @@ export default function App() {
       setBackendConnected(true)
       try {
         const setup = await api.setupStatus()
-        const ok = !!setup.credentials_saved && !!setup.credentials_valid
+        const ok = !!setup.logged_in
         setIsSetup(ok)
         if (!ok && !credModalAutoShown.current) {
           credModalAutoShown.current = true
@@ -221,6 +221,54 @@ export default function App() {
     [backendConnected, isSetup, isSending, pushMessage, replaceMessage, upsertTask],
   )
 
+  // ── Helper: handle captcha_required during polling ──────────────
+  async function pollUntilWithCaptcha(taskId, terminalStatuses, thinkingOrDraftId) {
+    let attempts = 0
+    while (attempts < POLL_MAX_ATTEMPTS) {
+      attempts++
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS))
+      try {
+        const data = await api.getTask(taskId)
+
+        if (data.status === 'captcha_required') {
+          // Show captcha card, replacing thinking indicator if present
+          const captchaMsg = {
+            type: 'captcha',
+            captcha: {
+              taskId,
+              captcha_type: data.captcha_type,
+              details: data.captcha_details,
+              sessionUrl: data.session_url,
+            },
+          }
+
+          setMessages((prev) => {
+            const alreadyHasCaptcha = prev.some(
+              (m) => m.type === 'captcha' && m.captcha?.taskId === taskId,
+            )
+            if (alreadyHasCaptcha) return prev
+
+            if (thinkingOrDraftId) {
+              return prev.map((m) =>
+                m.id === thinkingOrDraftId
+                  ? { ...m, ...captchaMsg }
+                  : m,
+              )
+            }
+            return [...prev, { id: uuid(), timestamp: Date.now(), ...captchaMsg }]
+          })
+          // Keep polling — the agent is waiting for the event
+          continue
+        }
+
+        if (terminalStatuses.includes(data.status)) return data
+      } catch (e) {
+        if (attempts >= 3) return { status: 'error', error: e.message || 'Lost connection' }
+      }
+    }
+    return { status: 'error', error: 'Task timed out.' }
+  }
+
   // ── Publish a draft ──────────────────────────────────────────────
   const handlePublishDraft = useCallback(
     async (draftId, finalText) => {
@@ -228,6 +276,10 @@ export default function App() {
       if (!trimmed) return
 
       // Find draft message and flip its status to 'publishing'
+      const draftMsgId = messages.find(
+        (m) => m.type === 'draft' && m.draft?.id === draftId,
+      )?.id
+
       setMessages((prev) =>
         prev.map((m) =>
           m.type === 'draft' && m.draft?.id === draftId
@@ -240,9 +292,14 @@ export default function App() {
 
       try {
         await api.publishDraft(draftId, trimmed)
-        const result = await pollUntil(draftId, ['done', 'error'])
+        const result = await pollUntilWithCaptcha(draftId, ['done', 'error'], draftMsgId)
 
         const completedAt = Date.now()
+
+        // Remove any captcha card for this task
+        setMessages((prev) =>
+          prev.filter((m) => !(m.type === 'captcha' && m.captcha?.taskId === draftId)),
+        )
 
         if (result.status === 'error') {
           const errMsg = result.error || 'Failed to publish.'
@@ -251,7 +308,6 @@ export default function App() {
             error: errMsg,
             completedAt,
           })
-          // Replace draft card with error task card
           setMessages((prev) =>
             prev.map((m) =>
               m.type === 'draft' && m.draft?.id === draftId
@@ -316,7 +372,27 @@ export default function App() {
         )
       }
     },
-    [tasks, upsertTask],
+    [tasks, upsertTask, messages],
+  )
+
+  // ── CAPTCHA solved handler ────────────────────────────────────────
+  const handleCaptchaSolved = useCallback(
+    async (taskId) => {
+      try {
+        await api.confirmCaptchaSolved(taskId)
+      } catch {
+        // Endpoint may 404 if agent already moved on — that's fine
+      }
+      // Replace captcha card with thinking dots while agent resumes
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.type === 'captcha' && m.captcha?.taskId === taskId
+            ? { ...m, type: 'thinking', captcha: undefined }
+            : m,
+        ),
+      )
+    },
+    [],
   )
 
   const handleCancelDraft = useCallback(
@@ -367,6 +443,7 @@ export default function App() {
             isSetup={isSetup}
             onPublishDraft={handlePublishDraft}
             onCancelDraft={handleCancelDraft}
+            onCaptchaSolved={handleCaptchaSolved}
           />
         )}
         {page === 'dashboard' && (

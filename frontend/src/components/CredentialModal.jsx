@@ -1,43 +1,90 @@
 import { useState } from 'react'
 import { api } from '../api.js'
 import {
-  IconAlertCircle, IconCheck, IconClose, IconEye, IconEyeOff, IconLogout,
+  IconAlertCircle, IconCheck, IconClose, IconLoader, IconLogout,
 } from './Icons.jsx'
 
+const IconExternalLink = ({ size = 20 }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+    <polyline points="15 3 21 3 21 9" />
+    <line x1="10" y1="14" x2="21" y2="3" />
+  </svg>
+)
+
+/**
+ * Login modal — the user logs into Facebook manually via a Browserbase
+ * cloud browser session.  No credentials are stored on the backend.
+ *
+ * States: idle → starting → waiting → verifying → (success | error)
+ */
 export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) {
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [showPassword, setShowPassword] = useState(false)
-  const [saving, setSaving] = useState(false)
+  const [phase, setPhase] = useState('idle') // idle | starting | waiting | verifying
+  const [sessionId, setSessionId] = useState(null)
+  const [sessionUrl, setSessionUrl] = useState(null)
+  const [liveViewUrl, setLiveViewUrl] = useState(null)
   const [error, setError] = useState('')
-  const [success, setSuccess] = useState('')
+  const [verifyHint, setVerifyHint] = useState('')
   const [loggingOut, setLoggingOut] = useState(false)
 
-  async function handleSave() {
-    if (!email.trim() || !password.trim()) {
-      setError('Please fill in both fields')
-      return
-    }
-    setSaving(true)
+  async function handleStartLogin() {
+    setPhase('starting')
     setError('')
-    setSuccess('')
+    setVerifyHint('')
     try {
-      await api.saveCredentials(email.trim(), password.trim())
-      onSave()
+      const data = await api.startLogin()
+      setSessionId(data.session_id)
+      setSessionUrl(data.session_url)
+      setLiveViewUrl(data.live_view_url || null)
+      setPhase('waiting')
     } catch (e) {
-      setError(e.message || 'Could not connect to backend')
-    } finally {
-      setSaving(false)
+      setError(e.message || 'Failed to start login session')
+      setPhase('idle')
     }
+  }
+
+  async function handleVerify() {
+    if (!sessionId) return
+    setPhase('verifying')
+    setVerifyHint('')
+    setError('')
+    try {
+      const data = await api.verifyLogin(sessionId)
+      if (data.status === 'logged_in') {
+        onSave()
+      } else {
+        const hint =
+          data.state === 'login'
+            ? 'You are still on the login page. Please finish logging in.'
+            : data.state === 'captcha' || data.state === 'checkpoint'
+              ? 'A security challenge is showing. Please solve it first.'
+              : 'Login not detected yet. Please finish logging in.'
+        setVerifyHint(hint)
+        setPhase('waiting')
+      }
+    } catch (e) {
+      setError(e.message || 'Verification failed')
+      setPhase('waiting')
+    }
+  }
+
+  async function handleCancel() {
+    if (sessionId) {
+      try { await api.cancelLogin(sessionId) } catch { /* ok */ }
+    }
+    setSessionId(null)
+    setSessionUrl(null)
+    setLiveViewUrl(null)
+    setPhase('idle')
+    setError('')
+    setVerifyHint('')
   }
 
   async function handleLogout() {
     setLoggingOut(true)
     setError('')
-    setSuccess('')
     try {
       await api.logout()
-      setSuccess('Credentials removed successfully. You can connect another account now.')
       await onLogout?.()
     } catch (e) {
       setError(e.message || 'Failed to logout')
@@ -46,17 +93,17 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
     }
   }
 
-  return (
-    <div style={styles.overlay} onClick={onClose}>
-      <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
-        <div style={styles.header}>
-          <h2 style={styles.title}>{isSetup ? 'Facebook Connection' : 'Connect Facebook'}</h2>
-          <button style={styles.closeBtn} onClick={onClose} aria-label="Close">
-            <IconClose size={18} />
-          </button>
-        </div>
-
-        {isSetup ? (
+  // ── Connected state ──────────────────────────────────────────
+  if (isSetup) {
+    return (
+      <div style={styles.overlay} onClick={onClose}>
+        <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+          <div style={styles.header}>
+            <h2 style={styles.title}>Facebook Connection</h2>
+            <button style={styles.closeBtn} onClick={onClose} aria-label="Close">
+              <IconClose size={18} />
+            </button>
+          </div>
           <div style={styles.body}>
             <div style={styles.connectedCard}>
               <div style={styles.connectedIcon}>
@@ -65,7 +112,7 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
               <div>
                 <div style={styles.connectedTitle}>Facebook Connected</div>
                 <div style={styles.connectedSub}>
-                  Your credentials are encrypted and stored securely.
+                  Your session cookies are saved in Browserbase. No passwords stored.
                 </div>
               </div>
             </div>
@@ -75,7 +122,7 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
               disabled={loggingOut}
             >
               <IconLogout size={16} />
-              {loggingOut ? 'Logging out...' : 'Disconnect & Clear Session'}
+              {loggingOut ? 'Disconnecting...' : 'Disconnect & Clear Session'}
             </button>
             {error && (
               <div style={styles.error}>
@@ -83,76 +130,124 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
                 {error}
               </div>
             )}
-            {success && (
-              <div style={styles.success}>
-                <IconCheck size={14} />
-                {success}
-              </div>
-            )}
           </div>
-        ) : (
-          <div style={styles.body}>
-            <p style={styles.description}>
-              Enter your Facebook credentials. They are encrypted with AES-128 and stored
-              locally on your server. Never sent anywhere else.
-            </p>
+        </div>
+      </div>
+    )
+  }
 
-            <div style={styles.field}>
-              <label style={styles.label}>Email</label>
-              <input
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="your@email.com"
-                style={styles.input}
-                autoFocus
-              />
+  // ── Login flow ───────────────────────────────────────────────
+  return (
+    <div style={styles.overlay} onClick={phase === 'idle' ? onClose : undefined}>
+      <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+        <div style={styles.header}>
+          <h2 style={styles.title}>Connect Facebook</h2>
+          <button
+            style={styles.closeBtn}
+            onClick={phase === 'waiting' ? handleCancel : onClose}
+            aria-label="Close"
+          >
+            <IconClose size={18} />
+          </button>
+        </div>
+
+        <div style={styles.body}>
+          {phase === 'idle' && (
+            <>
+              <p style={styles.description}>
+                Log into Facebook in a secure cloud browser. No credentials are stored
+                on this server — only session cookies are saved for automation.
+              </p>
+              <button style={styles.primaryBtn} onClick={handleStartLogin}>
+                Login to Facebook
+              </button>
+            </>
+          )}
+
+          {phase === 'starting' && (
+            <div style={styles.loadingWrap}>
+              <IconLoader size={24} />
+              <p style={styles.loadingText}>Starting browser session...</p>
             </div>
+          )}
 
-            <div style={styles.field}>
-              <label style={styles.label}>Password</label>
-              <div style={styles.passwordWrap}>
-                <input
-                  type={showPassword ? 'text' : 'password'}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="••••••••"
-                  style={{ ...styles.input, paddingRight: 42 }}
-                  onKeyDown={(e) => e.key === 'Enter' && handleSave()}
+          {(phase === 'waiting' || phase === 'verifying') && (
+            <>
+              <div style={styles.banner}>
+                <span>Log into Facebook in the window below, then click <strong>I&apos;m Logged In</strong>.</span>
+                {sessionUrl && (
+                  <a
+                    href={sessionUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={styles.openInTabLink}
+                  >
+                    <IconExternalLink size={12} />
+                    Open in new tab
+                  </a>
+                )}
+              </div>
+
+              {liveViewUrl ? (
+                <iframe
+                  title="Facebook Login (Browserbase Live View)"
+                  src={liveViewUrl}
+                  style={styles.liveView}
+                  sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-pointer-lock"
+                  allow="clipboard-read; clipboard-write"
                 />
+              ) : (
+                <div style={styles.iframeFallback}>
+                  <IconAlertCircle size={14} />
+                  <span>
+                    Live view isn&apos;t available. {sessionUrl ? (
+                      <a href={sessionUrl} target="_blank" rel="noopener noreferrer">
+                        Open the session in a new tab
+                      </a>
+                    ) : 'Try again.'}
+                  </span>
+                </div>
+              )}
+
+              {verifyHint && (
+                <div style={styles.warning}>
+                  <IconAlertCircle size={14} />
+                  {verifyHint}
+                </div>
+              )}
+
+              <div style={styles.buttonRow}>
+                <button style={styles.secondaryBtn} onClick={handleCancel}>
+                  Cancel
+                </button>
                 <button
-                  style={styles.eyeBtn}
-                  onClick={() => setShowPassword(!showPassword)}
-                  type="button"
-                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  style={{
+                    ...styles.primaryBtn,
+                    opacity: phase === 'verifying' ? 0.7 : 1,
+                  }}
+                  onClick={handleVerify}
+                  disabled={phase === 'verifying'}
                 >
-                  {showPassword ? <IconEyeOff size={16} /> : <IconEye size={16} />}
+                  {phase === 'verifying' ? (
+                    <>
+                      <IconLoader size={14} />
+                      Checking...
+                    </>
+                  ) : (
+                    "I'm Logged In"
+                  )}
                 </button>
               </div>
+            </>
+          )}
+
+          {error && (
+            <div style={styles.error}>
+              <IconAlertCircle size={14} />
+              {error}
             </div>
-
-            {error && (
-              <div style={styles.error}>
-                <IconAlertCircle size={14} />
-                {error}
-              </div>
-            )}
-            {success && (
-              <div style={styles.success}>
-                <IconCheck size={14} />
-                {success}
-              </div>
-            )}
-
-            <button
-              style={{ ...styles.saveBtn, opacity: saving ? 0.7 : 1 }}
-              onClick={handleSave}
-              disabled={saving}
-            >
-              {saving ? 'Connecting...' : 'Connect Facebook'}
-            </button>
-          </div>
-        )}
+          )}
+        </div>
       </div>
     </div>
   )
@@ -174,11 +269,14 @@ const styles = {
   modal: {
     background: '#fff',
     borderRadius: 16,
-    width: 420,
-    maxWidth: '90vw',
+    width: 960,
+    maxWidth: '94vw',
+    maxHeight: '92vh',
     boxShadow: '0 24px 80px rgba(0,0,0,0.15)',
     animation: 'fadeInUp 300ms ease',
     overflow: 'hidden',
+    display: 'flex',
+    flexDirection: 'column',
   },
   header: {
     display: 'flex',
@@ -211,32 +309,151 @@ const styles = {
     fontSize: 13,
     color: 'var(--text-secondary)',
     lineHeight: 1.6,
+    margin: 0,
   },
-  field: { display: 'flex', flexDirection: 'column', gap: 6 },
-  label: { fontSize: 13, fontWeight: 600, color: 'var(--text)' },
-  input: {
-    padding: '10px 14px',
+  primaryBtn: {
+    padding: '11px 20px',
+    borderRadius: 10,
+    border: 'none',
+    background: 'var(--primary)',
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: 600,
+    cursor: 'pointer',
+    transition: 'all 150ms',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  secondaryBtn: {
+    padding: '10px 18px',
     borderRadius: 10,
     border: '1.5px solid var(--border)',
-    fontSize: 14,
-    outline: 'none',
-    transition: 'border-color 150ms',
-    width: '100%',
-    background: 'var(--bg-alt)',
-    color: 'var(--text)',
-  },
-  passwordWrap: { position: 'relative' },
-  eyeBtn: {
-    position: 'absolute',
-    right: 10,
-    top: '50%',
-    transform: 'translateY(-50%)',
-    background: 'none',
-    border: 'none',
-    color: 'var(--text-muted)',
-    padding: 4,
-    display: 'flex',
+    background: '#fff',
+    fontSize: 13,
+    fontWeight: 500,
+    color: 'var(--text-secondary)',
     cursor: 'pointer',
+  },
+  buttonRow: {
+    display: 'flex',
+    gap: 10,
+    justifyContent: 'flex-end',
+  },
+  loadingWrap: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    gap: 12,
+    padding: '20px 0',
+    color: 'var(--primary)',
+  },
+  loadingText: {
+    fontSize: 14,
+    color: 'var(--text-secondary)',
+    margin: 0,
+  },
+  instructionCard: {
+    display: 'flex',
+    gap: 14,
+    padding: 14,
+    background: 'var(--bg-alt)',
+    borderRadius: 12,
+    border: '1px solid var(--border)',
+  },
+  stepNumber: {
+    width: 28,
+    height: 28,
+    borderRadius: 8,
+    background: 'var(--primary-light)',
+    color: 'var(--primary-text)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: 13,
+    fontWeight: 700,
+    flexShrink: 0,
+  },
+  stepTitle: {
+    fontSize: 13,
+    fontWeight: 600,
+    color: 'var(--text)',
+    marginBottom: 2,
+  },
+  stepSub: {
+    fontSize: 12,
+    color: 'var(--text-secondary)',
+    lineHeight: 1.5,
+  },
+  banner: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    padding: '10px 14px',
+    background: 'var(--primary-light)',
+    border: '1px solid var(--border)',
+    borderRadius: 10,
+    fontSize: 13,
+    color: 'var(--text-secondary)',
+  },
+  openInTabLink: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 4,
+    fontSize: 12,
+    color: 'var(--primary-text)',
+    textDecoration: 'none',
+    fontWeight: 600,
+    flexShrink: 0,
+  },
+  liveView: {
+    width: '100%',
+    height: 560,
+    minHeight: 420,
+    border: '1px solid var(--border)',
+    borderRadius: 12,
+    background: '#000',
+    display: 'block',
+  },
+  iframeFallback: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+    padding: '14px 16px',
+    background: 'var(--error-light)',
+    border: '1px solid #FECACA',
+    borderRadius: 10,
+    fontSize: 13,
+    color: 'var(--error)',
+  },
+  openBrowserBtn: {
+    padding: '10px 16px',
+    borderRadius: 10,
+    border: '1.5px solid var(--primary)',
+    background: 'var(--primary-light)',
+    fontSize: 14,
+    fontWeight: 600,
+    color: 'var(--primary-text)',
+    textDecoration: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    transition: 'all 150ms',
+  },
+  warning: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    fontSize: 13,
+    color: '#92400E',
+    padding: '8px 12px',
+    background: '#FEF3C7',
+    borderRadius: 8,
+    border: '1px solid #FDE68A',
   },
   error: {
     display: 'flex',
@@ -247,29 +464,6 @@ const styles = {
     padding: '8px 12px',
     background: 'var(--error-light)',
     borderRadius: 8,
-  },
-  success: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 6,
-    fontSize: 13,
-    color: '#065F46',
-    padding: '8px 12px',
-    background: 'var(--success-light)',
-    borderRadius: 8,
-    border: '1px solid #D1FAE5',
-  },
-  saveBtn: {
-    padding: '11px 20px',
-    borderRadius: 10,
-    border: 'none',
-    background: 'var(--primary)',
-    color: '#fff',
-    fontSize: 14,
-    fontWeight: 600,
-    cursor: 'pointer',
-    transition: 'all 150ms',
-    marginTop: 4,
   },
   connectedCard: {
     display: 'flex',

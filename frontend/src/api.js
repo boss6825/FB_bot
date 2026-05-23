@@ -13,17 +13,16 @@ async function jsonFetch(url, opts = {}) {
 export const api = {
   health: () => jsonFetch('/health'),
   setupStatus: () => jsonFetch('/status/setup'),
-  saveCredentials: (email, password) =>
-    jsonFetch('/auth/credentials', {
-      method: 'POST',
-      body: JSON.stringify({ email, password }),
-    }),
+
+  // Login flow (user logs in manually via Browserbase session)
+  startLogin: () => jsonFetch('/auth/login/start', { method: 'POST' }),
+  verifyLogin: (sessionId) =>
+    jsonFetch(`/auth/login/verify/${sessionId}`, { method: 'POST' }),
+  cancelLogin: (sessionId) =>
+    jsonFetch(`/auth/login/cancel/${sessionId}`, { method: 'POST' }),
   logout: () => jsonFetch('/auth/logout', { method: 'POST' }),
-  sendChat: (message, taskId) =>
-    jsonFetch('/chat', {
-      method: 'POST',
-      body: JSON.stringify({ message, task_id: taskId }),
-    }),
+
+  // Draft / publish
   createDraft: (payloadOrMessage, taskId) => {
     const payload =
       typeof payloadOrMessage === 'string'
@@ -39,7 +38,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ text }),
     }),
+
+  // Task polling
   getTask: (taskId) => jsonFetch(`/task/${taskId}`),
+  confirmCaptchaSolved: (taskId) =>
+    jsonFetch(`/task/${taskId}/captcha-solved`, { method: 'POST' }),
 }
 
 export function uuid() {

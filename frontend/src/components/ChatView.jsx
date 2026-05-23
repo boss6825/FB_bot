@@ -9,11 +9,17 @@ const QUICK_ACTIONS = [
   'Post a company update',
 ]
 
+const CAPTCHA_LABELS = {
+  captcha: 'CAPTCHA Required',
+  checkpoint: 'Security Checkpoint',
+}
+
 const STATUS_CONFIG = {
   processing: { color: 'var(--primary)', bg: 'var(--primary-light)', label: 'Processing', Icon: IconLoader },
   pending: { color: 'var(--warning)', bg: 'var(--warning-light)', label: 'Queued', Icon: IconHistory },
   running: { color: 'var(--primary)', bg: 'var(--primary-light)', label: 'Running', Icon: IconLoader },
   publishing: { color: 'var(--primary)', bg: 'var(--primary-light)', label: 'Publishing', Icon: IconLoader },
+  captcha_required: { color: '#D97706', bg: '#FEF3C7', label: 'CAPTCHA Required', Icon: IconAlertCircle },
   done: { color: 'var(--success)', bg: 'var(--success-light)', label: 'Completed', Icon: IconCheck },
   error: { color: 'var(--error)', bg: 'var(--error-light)', label: 'Failed', Icon: IconAlertCircle },
 }
@@ -279,7 +285,101 @@ function DraftReviewCard({ draft, onPublish, onCancel, bubbleStyle }) {
   )
 }
 
-function MessageBubble({ message, bubbleStyle, onPublishDraft, onCancelDraft }) {
+function CaptchaInterventionCard({ captcha, onSolved }) {
+  const [confirming, setConfirming] = useState(false)
+  const title = CAPTCHA_LABELS[captcha.captcha_type] || 'Security Challenge'
+
+  const handleSolved = async () => {
+    setConfirming(true)
+    await onSolved(captcha.taskId)
+  }
+
+  return (
+    <div
+      style={{
+        border: '1px solid #F59E0B',
+        borderRadius: 12,
+        padding: 16,
+        background: '#FFFBEB',
+        maxWidth: 480,
+        animation: 'fadeInUp 300ms ease',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+        <div
+          style={{
+            width: 28,
+            height: 28,
+            borderRadius: 8,
+            background: '#FEF3C7',
+            color: '#D97706',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            flexShrink: 0,
+          }}
+        >
+          <IconAlertCircle size={15} />
+        </div>
+        <span style={{ fontSize: 14, fontWeight: 700, color: '#92400E' }}>{title}</span>
+      </div>
+
+      {captcha.details && (
+        <p style={{ fontSize: 13, color: '#78350F', lineHeight: 1.5, margin: '0 0 10px' }}>
+          {captcha.details}
+        </p>
+      )}
+
+      <p style={{ fontSize: 12, color: '#92400E', lineHeight: 1.5, margin: '0 0 12px' }}>
+        Open the browser session below, solve the challenge, then click &quot;I&apos;ve Solved It&quot;.
+      </p>
+
+      <div style={{ display: 'flex', gap: 8 }}>
+        <a
+          href={captcha.sessionUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{
+            padding: '7px 14px',
+            borderRadius: 8,
+            border: '1px solid #D97706',
+            background: '#fff',
+            fontSize: 13,
+            fontWeight: 600,
+            color: '#D97706',
+            textDecoration: 'none',
+            cursor: 'pointer',
+          }}
+        >
+          Open Browser Session
+        </a>
+        <button
+          onClick={handleSolved}
+          disabled={confirming}
+          style={{
+            padding: '7px 16px',
+            borderRadius: 8,
+            border: 'none',
+            background: '#D97706',
+            color: '#fff',
+            fontSize: 13,
+            fontWeight: 600,
+            cursor: confirming ? 'not-allowed' : 'pointer',
+            opacity: confirming ? 0.6 : 1,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+          }}
+        >
+          {confirming ? <IconLoader size={13} /> : null}
+          {confirming ? 'Resuming...' : "I've Solved It"}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function MessageBubble({ message, bubbleStyle, onPublishDraft, onCancelDraft, onCaptchaSolved }) {
   const rounded = bubbleStyle === 'rounded'
 
   if (message.type === 'thinking') {
@@ -319,6 +419,15 @@ function MessageBubble({ message, bubbleStyle, onPublishDraft, onCancelDraft }) 
           onCancel={onCancelDraft}
           bubbleStyle={bubbleStyle}
         />
+      </div>
+    )
+  }
+
+  if (message.type === 'captcha') {
+    return (
+      <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start', animation: 'fadeInUp 200ms ease' }}>
+        <BotAvatar />
+        <CaptchaInterventionCard captcha={message.captcha} onSolved={onCaptchaSolved} />
       </div>
     )
   }
@@ -471,6 +580,7 @@ export default function ChatView({
   isSetup,
   onPublishDraft,
   onCancelDraft,
+  onCaptchaSolved,
 }) {
   const [composeMode, setComposeMode] = useState('command')
   const [inputValue, setInputValue] = useState('')
@@ -554,6 +664,7 @@ export default function ChatView({
                 bubbleStyle={bubbleStyle}
                 onPublishDraft={onPublishDraft}
                 onCancelDraft={onCancelDraft}
+                onCaptchaSolved={onCaptchaSolved}
               />
             ))}
           </div>
