@@ -184,6 +184,24 @@ async def _evaluate_js(browser_session: BrowserSession, expression: str) -> Any:
     return result.get("result", {}).get("value")
 
 
+async def _dispatch_cdp_mouse_click(browser_session: BrowserSession, x: float, y: float) -> None:
+    cdp_session = await browser_session.get_or_create_cdp_session()
+    for event_type in ("mouseMoved", "mousePressed", "mouseReleased"):
+        params: dict[str, Any] = {
+            "type": event_type,
+            "x": x,
+            "y": y,
+            "button": "left",
+            "clickCount": 1,
+        }
+        if event_type == "mousePressed":
+            params["buttons"] = 1
+        await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+            params=params,
+            session_id=cdp_session.session_id,
+        )
+
+
 async def _composer_has_visible_post_button(browser_session: BrowserSession) -> bool:
     script = r"""
 (() => {
@@ -201,15 +219,21 @@ async def _composer_has_visible_post_button(browser_session: BrowserSession) -> 
 
 
 async def _force_click_post_button(browser_session: BrowserSession) -> tuple[bool, str]:
-    click_script = r"""
+    locate_script = r"""
 (() => {
   const isVisible = (el) => !!el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
   const isEnabled = (el) => !!el && el.getAttribute('aria-disabled') !== 'true';
-  const clickElement = (el) => {
-    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type => {
-      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-    });
-    if (typeof el.click === 'function') el.click();
+  const describe = (el, strategy) => {
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    const rect = el.getBoundingClientRect();
+    return {
+      found: true,
+      strategy,
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+      width: rect.width,
+      height: rect.height
+    };
   };
 
   const selectorCandidates = [
@@ -222,8 +246,7 @@ async def _force_click_post_button(browser_session: BrowserSession) -> tuple[boo
     const nodes = [...document.querySelectorAll(selector)];
     for (const node of nodes) {
       if (isVisible(node) && isEnabled(node)) {
-        clickElement(node);
-        return { clicked: true, strategy: selector };
+        return describe(node, selector);
       }
     }
   }
@@ -232,12 +255,11 @@ async def _force_click_post_button(browser_session: BrowserSession) -> tuple[boo
     .filter(el => (el.textContent || '').trim() === 'Post');
   for (const node of textMatches) {
     if (isVisible(node) && isEnabled(node)) {
-      clickElement(node);
-      return { clicked: true, strategy: 'text-content' };
+      return describe(node, 'text-content');
     }
   }
 
-  return { clicked: false, strategy: 'none' };
+  return { found: false, strategy: 'none' };
 })()
 """
 
@@ -246,8 +268,12 @@ async def _force_click_post_button(browser_session: BrowserSession) -> tuple[boo
         return False, "No visible Post button found in composer before fallback click."
 
     for attempt in range(1, POST_CLICK_FALLBACK_ATTEMPTS + 1):
-        value = await _evaluate_js(browser_session, click_script)
-        logger.info("Post-click JS fallback attempt %s result: %s", attempt, value)
+        value = await _evaluate_js(browser_session, locate_script)
+        logger.info("Post-click fallback attempt %s target: %s", attempt, value)
+        if not value or not value.get("found"):
+            await asyncio.sleep(POST_CLICK_FALLBACK_SLEEP_SECONDS)
+            continue
+        await _dispatch_cdp_mouse_click(browser_session, float(value["x"]), float(value["y"]))
         await asyncio.sleep(POST_CLICK_FALLBACK_SLEEP_SECONDS)
 
         after_visible = await _composer_has_visible_post_button(browser_session)
@@ -276,15 +302,21 @@ async def _comment_composer_has_visible_submit_button(browser_session: BrowserSe
 
 
 async def _force_click_comment_button(browser_session: BrowserSession) -> tuple[bool, str]:
-    click_script = r"""
+    locate_script = r"""
 (() => {
   const isVisible = (el) => !!el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
   const isEnabled = (el) => !!el && el.getAttribute('aria-disabled') !== 'true' && !(el.disabled === true);
-  const clickElement = (el) => {
-    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type => {
-      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-    });
-    if (typeof el.click === 'function') el.click();
+  const describe = (el, strategy) => {
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    const rect = el.getBoundingClientRect();
+    return {
+      found: true,
+      strategy,
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+      width: rect.width,
+      height: rect.height
+    };
   };
 
   const selectorCandidates = [
@@ -297,8 +329,7 @@ async def _force_click_comment_button(browser_session: BrowserSession) -> tuple[
     const nodes = [...document.querySelectorAll(selector)];
     for (const node of nodes) {
       if (isVisible(node) && isEnabled(node)) {
-        clickElement(node);
-        return { clicked: true, strategy: selector };
+        return describe(node, selector);
       }
     }
   }
@@ -307,12 +338,11 @@ async def _force_click_comment_button(browser_session: BrowserSession) -> tuple[
     .filter(el => (el.textContent || '').trim() === 'Comment');
   for (const node of textMatches) {
     if (isVisible(node) && isEnabled(node)) {
-      clickElement(node);
-      return { clicked: true, strategy: 'text-content' };
+      return describe(node, 'text-content');
     }
   }
 
-  return { clicked: false, strategy: 'none' };
+  return { found: false, strategy: 'none' };
 })()
 """
 
@@ -321,9 +351,10 @@ async def _force_click_comment_button(browser_session: BrowserSession) -> tuple[
         return False, "No visible Comment submit button found before fallback click."
 
     for attempt in range(1, COMMENT_CLICK_FALLBACK_ATTEMPTS + 1):
-        value = await _evaluate_js(browser_session, click_script)
-        logger.info("Comment-click JS fallback attempt %s result: %s", attempt, value)
-        if value and value.get("clicked"):
+        value = await _evaluate_js(browser_session, locate_script)
+        logger.info("Comment-click fallback attempt %s target: %s", attempt, value)
+        if value and value.get("found"):
+            await _dispatch_cdp_mouse_click(browser_session, float(value["x"]), float(value["y"]))
             await asyncio.sleep(COMMENT_CLICK_FALLBACK_SLEEP_SECONDS)
             return True, f"Deterministic Comment click executed via fallback (attempt {attempt})."
 
@@ -428,6 +459,31 @@ async def _run_fb_task_local(task_description: str, context_id: str | None = Non
 
     llm = ChatAnthropic(model=ANTHROPIC_MODEL)
     full_task = _build_task(task_description, has_session=has_session)
+    is_publish_task = _is_post_publish_task(task_description) or _is_comment_publish_task(task_description)
+    max_steps = 18 if is_publish_task else 35
+    deterministic_result: dict[str, str | None] = {"message": None}
+
+    async def click_publish_button_when_ready(agent: Agent) -> None:
+        if deterministic_result["message"] or agent.history.is_done():
+            return
+
+        try:
+            if _is_post_publish_task(task_description) and await _composer_has_visible_post_button(browser_session):
+                clicked, fallback_message = await _force_click_post_button(browser_session)
+            elif (
+                _is_comment_publish_task(task_description)
+                and await _comment_composer_has_visible_submit_button(browser_session)
+            ):
+                clicked, fallback_message = await _force_click_comment_button(browser_session)
+            else:
+                return
+        except Exception:
+            logger.exception("Deterministic publish click during agent step failed")
+            return
+
+        if clicked:
+            deterministic_result["message"] = fallback_message
+            agent.stop()
 
     try:
         agent = Agent(
@@ -443,8 +499,12 @@ async def _run_fb_task_local(task_description: str, context_id: str | None = Non
             include_tool_call_examples=True,
         )
 
-        history = await agent.run(max_steps=35)
+        history = await agent.run(max_steps=max_steps, on_step_end=click_publish_button_when_ready)
         final_result = history.final_result()
+
+        if deterministic_result["message"]:
+            await _persist_session_state(browser_session)
+            return deterministic_result["message"] or "Task completed."
 
         if not history.is_done():
             if _is_post_publish_task(task_description):
