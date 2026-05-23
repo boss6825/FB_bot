@@ -1,11 +1,22 @@
 import asyncio
+import sys
+import threading
 import logging
 import os
-import re
 from pathlib import Path
+from typing import Any
 
-from stagehand import AsyncStagehand
+from browser_use import Agent, BrowserSession
+from browser_use.llm import ChatAnthropic
 from dotenv import load_dotenv
+
+from session import SESSION_FILE, load_session, save_session
+from config import (
+    ANTHROPIC_MODEL,
+    BROWSER_CHANNEL,
+    BROWSER_USER_AGENT,
+    BROWSER_USER_DATA_DIR,
+)
 
 ENV_FILE = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=ENV_FILE)
@@ -13,318 +24,465 @@ load_dotenv(dotenv_path=ENV_FILE)
 logger = logging.getLogger("fb_agent.agent")
 
 FB_URL = "https://www.facebook.com"
-STAGEHAND_MODEL = os.getenv("STAGEHAND_MODEL", "anthropic/claude-sonnet-4-6")
-CAPTCHA_WAIT_SECONDS = int(os.getenv("STAGEHAND_CAPTCHA_WAIT_SECONDS", "600"))
-CAPTCHA_RESUME_SECONDS = 30
-# How long the manual-login Browserbase session is allowed to stay open
-# (in seconds).  The user needs enough time to handle Facebook OTP / 2FA /
-# email-verification flows, so give them a generous window.
-LOGIN_SESSION_TIMEOUT_SECONDS = int(os.getenv("STAGEHAND_LOGIN_TIMEOUT_SECONDS", "1800"))
+BROWSER_HEADLESS = os.getenv("BROWSER_HEADLESS", "false").strip().lower() in {"1", "true", "yes", "on"}
+BROWSER_KEEP_OPEN = os.getenv("BROWSER_KEEP_OPEN", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+POST_CLICK_FALLBACK_ATTEMPTS = 3
+POST_CLICK_FALLBACK_SLEEP_SECONDS = 1.2
+COMMENT_CLICK_FALLBACK_ATTEMPTS = 3
+COMMENT_CLICK_FALLBACK_SLEEP_SECONDS = 1.0
+
+_manual_login_sessions: dict[str, dict[str, Any]] = {}
+_browser_loop: asyncio.AbstractEventLoop | None = None
+_browser_loop_ready = threading.Event()
+_browser_loop_lock = threading.Lock()
 
 
-def _extract_data(result) -> dict:
-    if hasattr(result, "data") and isinstance(result.data, dict):
-        return result.data
-    return {}
+def _browser_launch_kwargs() -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "headless": False,
+        "viewport": {"width": 1365, "height": 900},
+    }
+    if BROWSER_CHANNEL:
+        kwargs["channel"] = BROWSER_CHANNEL
+    return kwargs
 
 
-async def _get_facebook_state(client: AsyncStagehand, session_id: str) -> dict:
-    """Classify the current Facebook page."""
-    try:
-        result = await client.sessions.extract(
-            session_id,
-            instruction=(
-                "Classify the current Facebook page. Say whether it is the logged-in "
-                "home/feed, a normal login page, a captcha/security challenge page, "
-                "a checkpoint/identity verification page, or something else."
-            ),
-            schema={
-                "type": "object",
-                "properties": {
-                    "state": {
-                        "type": "string",
-                        "enum": ["feed", "login", "captcha", "checkpoint", "other"],
-                    },
-                    "details": {
-                        "type": "string",
-                        "description": "Short visible reason for the classification",
-                    },
-                },
-                "required": ["state"],
-            },
+def _browser_loop_thread() -> None:
+    global _browser_loop
+    if sys.platform == "win32" and hasattr(asyncio, "ProactorEventLoop"):
+        loop = asyncio.ProactorEventLoop()
+    else:
+        loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _browser_loop = loop
+    _browser_loop_ready.set()
+    loop.run_forever()
+
+
+def _get_browser_loop() -> asyncio.AbstractEventLoop:
+    global _browser_loop
+    with _browser_loop_lock:
+        if _browser_loop and _browser_loop.is_running():
+            return _browser_loop
+
+        _browser_loop_ready.clear()
+        thread = threading.Thread(
+            target=_browser_loop_thread,
+            name="playwright-login-loop",
+            daemon=True,
         )
-        data = _extract_data(result)
-        if data.get("state") in {"feed", "login", "captcha", "checkpoint", "other"}:
-            return data
-    except Exception:
-        logger.debug("Could not determine Facebook page state", exc_info=True)
-
-    return {"state": "other", "details": "Could not classify page state"}
+        thread.start()
+        _browser_loop_ready.wait(timeout=10)
+        if not _browser_loop or not _browser_loop.is_running():
+            raise RuntimeError("Could not start Playwright browser loop.")
+        return _browser_loop
 
 
-async def _is_logged_in(client: AsyncStagehand, session_id: str) -> bool:
-    """Check if the current page shows the Facebook feed (logged in)."""
-    state = await _get_facebook_state(client, session_id)
-    return state.get("state") == "feed"
-
-
-# ── Login session management (user logs in manually) ─────────────
-
-async def start_login_session(context_id: str) -> dict:
-    """Start a Browserbase session for manual Facebook login.
-
-    Creates the session directly via Browserbase REST (bypassing Stagehand)
-    so our backend isn't holding a Playwright connection that Browserbase
-    would tear down a few seconds after the HTTP request returns.
-
-    Returns { session_id, session_url, live_view_url, connect_url, context_id }.
-    The session stays alive (keepAlive=True) until verified or cancelled.
-    """
-    from session import (
-        create_browserbase_session,
-        get_session_debug_urls,
-    )
-
-    session_info = await create_browserbase_session(
-        context_id=context_id,
-        keep_alive=True,
-        timeout_seconds=LOGIN_SESSION_TIMEOUT_SECONDS,
-    )
-    session_id = session_info["id"]
-    connect_url = session_info.get("connectUrl")
-    logger.info(
-        "Login session started: %s (keepAlive=True, timeout=%ds)",
-        session_id, LOGIN_SESSION_TIMEOUT_SECONDS,
-    )
-
-    # We can't pre-navigate without Playwright/Stagehand attaching (which
-    # would create the same "Stagehand drops connection" problem).  The
-    # iframe will load whatever page the browser is on; we tell the user
-    # to navigate to facebook.com from a small banner.  In practice
-    # Browserbase opens a blank page; we surface this URL to the frontend
-    # so it can encourage the user to navigate.
-
-    live_view_url = None
+async def _run_on_browser_loop(coro):
     try:
-        debug = await get_session_debug_urls(session_id)
-        # Prefer the chrome version (has a URL bar) so the user can navigate
-        # to facebook.com themselves — we no longer pre-navigate because
-        # doing so via Stagehand/Playwright would re-introduce the
-        # connection-drop bug that killed the session in 3–4 seconds.
-        live_view_url = (
-            debug.get("debuggerUrl")
-            or debug.get("debuggerFullscreenUrl")
-            or debug.get("liveViewUrl")
-        )
-    except Exception:
-        logger.warning("Could not fetch live-view URL for %s", session_id, exc_info=True)
+        if asyncio.get_running_loop() is _browser_loop:
+            return await coro
+    except RuntimeError:
+        pass
+
+    future = asyncio.run_coroutine_threadsafe(coro, _get_browser_loop())
+    return await asyncio.wrap_future(future)
+
+
+async def start_login_session(context_id: str | None = None) -> dict:
+    return await _run_on_browser_loop(_start_login_session_local(context_id))
+
+
+async def _start_login_session_local(context_id: str | None = None) -> dict:
+    """Open a local browser window for manual Facebook login."""
+    import uuid
+    from playwright.async_api import async_playwright
+
+    playwright = await async_playwright().start()
+    context = await playwright.chromium.launch_persistent_context(
+        user_data_dir=BROWSER_USER_DATA_DIR,
+        **_browser_launch_kwargs(),
+    )
+    page = context.pages[0] if context.pages else await context.new_page()
+    await page.goto(FB_URL, wait_until="domcontentloaded")
+
+    session_id = str(uuid.uuid4())
+    _manual_login_sessions[session_id] = {
+        "playwright": playwright,
+        "context": context,
+    }
+    logger.info("Local login browser opened: %s", session_id)
 
     return {
         "session_id": session_id,
-        "session_url": f"https://www.browserbase.com/sessions/{session_id}",
-        "live_view_url": live_view_url,
-        "connect_url": connect_url,
-        "context_id": context_id,
+        "session_url": None,
+        "live_view_url": None,
+        "mode": "local_browser",
     }
 
 
 async def verify_login_session(session_id: str) -> dict:
-    """Optimistic verify: trust the user clicked 'I'm Logged In'.
+    return await _run_on_browser_loop(_verify_login_session_local(session_id))
 
-    We can't inspect the page without re-attaching a Playwright/Stagehand
-    client (which is what was killing the session earlier).  Cookies are
-    persisted to the context when the session ends; if the user actually
-    didn't log in, the next automation task will fail with 'Login expired'
-    and they can re-run the login flow.
-    """
-    return {"logged_in": True, "state": "feed", "details": "optimistic"}
+
+async def _verify_login_session_local(session_id: str) -> dict:
+    """Persist local browser cookies after the user confirms login."""
+    session = _manual_login_sessions.get(session_id)
+    if not session:
+        return {"logged_in": False, "state": "other", "details": "Login browser is not active."}
+
+    context = session["context"]
+    cookies = await context.cookies(FB_URL)
+    logged_in = any(cookie.get("name") == "c_user" for cookie in cookies)
+    if not logged_in:
+        return {
+            "logged_in": False,
+            "state": "login",
+            "details": "Facebook login cookie was not found yet.",
+        }
+
+    await context.storage_state(path=str(SESSION_FILE))
+    await _end_session_local(session_id)
+    return {"logged_in": True, "state": "feed", "details": "Saved local browser session."}
 
 
 async def end_session(session_id: str) -> None:
-    """End a Browserbase session via REST."""
-    from session import release_browserbase_session
-    await release_browserbase_session(session_id)
-    logger.info("Session released: %s", session_id)
+    await _run_on_browser_loop(_end_session_local(session_id))
 
 
-# ── Task parsing ─────────────────────────────────────────────────
-
-def _parse_task(task_description: str) -> tuple[str, str, str | None]:
-    """Parse a task string built by build_agent_task() into (action, content, url)."""
-    lower = task_description.lower()
-
-    # Extract quoted content
-    quotes = re.findall(r'"([^"]*)"', task_description)
-    content = quotes[0] if quotes else task_description
-
-    if "create a new facebook post" in lower:
-        return "post", content, None
-
-    if "leave a comment" in lower:
-        url_match = re.search(r"https?://\S+", task_description)
-        url = url_match.group(0).rstrip('"') if url_match else None
-        return "comment", content, url
-
-    return "generic", content, None
+async def _end_session_local(session_id: str) -> None:
+    """Close a local manual-login browser session."""
+    session = _manual_login_sessions.pop(session_id, None)
+    if not session:
+        return
+    try:
+        await session["context"].close()
+    finally:
+        await session["playwright"].stop()
+        logger.info("Local login browser closed: %s", session_id)
 
 
-# ── Action handlers ──────────────────────────────────────────────
+def _is_post_publish_task(task_description: str) -> bool:
+    text = task_description.lower()
+    return "create a new facebook post" in text and "click the post button" in text
 
-async def _do_post(client: AsyncStagehand, session_id: str, content: str) -> str:
-    """Create a Facebook post."""
-    logger.info("Creating Facebook post...")
 
-    await client.sessions.act(
-        session_id,
-        input=(
-            "Click on 'What's on your mind?' or the create post area "
-            "to open the post composer dialog"
-        ),
+def _is_comment_publish_task(task_description: str) -> bool:
+    text = task_description.lower()
+    return "leave a comment with exactly this text" in text and "click the comment button" in text
+
+
+async def _evaluate_js(browser_session: BrowserSession, expression: str) -> Any:
+    cdp_session = await browser_session.get_or_create_cdp_session()
+    result = await cdp_session.cdp_client.send.Runtime.evaluate(
+        params={"expression": expression, "returnByValue": True, "awaitPromise": True},
+        session_id=cdp_session.session_id,
     )
-    await asyncio.sleep(2)
-
-    await client.sessions.act(
-        session_id,
-        input=f'Type the following text into the post composer text area: "{content}"',
-    )
-    await asyncio.sleep(1)
-
-    await client.sessions.act(
-        session_id,
-        input="Click the Post button to publish the post",
-    )
-    await asyncio.sleep(3)
-
-    return "Post published successfully."
+    if result.get("exceptionDetails"):
+        raise RuntimeError(result["exceptionDetails"].get("text", "JavaScript evaluation failed"))
+    return result.get("result", {}).get("value")
 
 
-async def _do_comment(
-    client: AsyncStagehand,
-    session_id: str,
-    target_url: str | None,
-    content: str,
-) -> str:
-    """Comment on a Facebook post."""
-    logger.info("Commenting on Facebook post: %s", target_url)
-
-    if target_url:
-        await client.sessions.navigate(session_id, url=target_url)
-        await asyncio.sleep(3)
-
-    await client.sessions.act(
-        session_id,
-        input="Click on the comment input field or 'Write a comment' area",
-    )
-    await asyncio.sleep(1)
-
-    await client.sessions.act(
-        session_id,
-        input=f'Type the following comment: "{content}"',
-    )
-    await asyncio.sleep(1)
-
-    await client.sessions.act(
-        session_id,
-        input="Press Enter or click the submit button to post the comment",
-    )
-    await asyncio.sleep(2)
-
-    return "Comment posted successfully."
+async def _composer_has_visible_post_button(browser_session: BrowserSession) -> bool:
+    script = r"""
+(() => {
+  const isVisible = (el) => !!el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
+  const isEnabled = (el) => !!el && el.getAttribute('aria-disabled') !== 'true';
+  const candidates = [
+    ...document.querySelectorAll('div[role="button"][aria-label="Post"], button[aria-label="Post"], [role="button"][aria-label="Post"]'),
+    ...[...document.querySelectorAll('div[role="button"],button')].filter(el => (el.textContent || '').trim() === 'Post')
+  ];
+  return candidates.some(el => isVisible(el) && isEnabled(el));
+})()
+"""
+    value = await _evaluate_js(browser_session, script)
+    return bool(value)
 
 
-async def _do_generic(
-    client: AsyncStagehand, session_id: str, task: str
-) -> str:
-    """Handle generic Facebook tasks using Stagehand execute (agentic mode)."""
-    logger.info("Executing generic task...")
+async def _force_click_post_button(browser_session: BrowserSession) -> tuple[bool, str]:
+    click_script = r"""
+(() => {
+  const isVisible = (el) => !!el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
+  const isEnabled = (el) => !!el && el.getAttribute('aria-disabled') !== 'true';
+  const clickElement = (el) => {
+    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type => {
+      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+    });
+    if (typeof el.click === 'function') el.click();
+  };
 
-    await client.sessions.execute(
-        session_id,
-        agent_config={"model": STAGEHAND_MODEL, "mode": "hybrid"},
-        execute_options={"instruction": task, "max_steps": 20},
-    )
-    return "Task completed successfully."
+  const selectorCandidates = [
+    'div[role="button"][aria-label="Post"]',
+    'button[aria-label="Post"]',
+    '[role="button"][aria-label="Post"]'
+  ];
+
+  for (const selector of selectorCandidates) {
+    const nodes = [...document.querySelectorAll(selector)];
+    for (const node of nodes) {
+      if (isVisible(node) && isEnabled(node)) {
+        clickElement(node);
+        return { clicked: true, strategy: selector };
+      }
+    }
+  }
+
+  const textMatches = [...document.querySelectorAll('div[role="button"],button')]
+    .filter(el => (el.textContent || '').trim() === 'Post');
+  for (const node of textMatches) {
+    if (isVisible(node) && isEnabled(node)) {
+      clickElement(node);
+      return { clicked: true, strategy: 'text-content' };
+    }
+  }
+
+  return { clicked: false, strategy: 'none' };
+})()
+"""
+
+    before_visible = await _composer_has_visible_post_button(browser_session)
+    if not before_visible:
+        return False, "No visible Post button found in composer before fallback click."
+
+    for attempt in range(1, POST_CLICK_FALLBACK_ATTEMPTS + 1):
+        value = await _evaluate_js(browser_session, click_script)
+        logger.info("Post-click JS fallback attempt %s result: %s", attempt, value)
+        await asyncio.sleep(POST_CLICK_FALLBACK_SLEEP_SECONDS)
+
+        after_visible = await _composer_has_visible_post_button(browser_session)
+        if not after_visible:
+            return True, f"Deterministic Post click succeeded via fallback (attempt {attempt})."
+
+    return False, "Post button remained visible after deterministic fallback clicks."
 
 
-# ── Main entry point ─────────────────────────────────────────────
+async def _comment_composer_has_visible_submit_button(browser_session: BrowserSession) -> bool:
+    script = r"""
+(() => {
+  const isVisible = (el) => !!el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
+  const isEnabled = (el) => !!el && el.getAttribute('aria-disabled') !== 'true' && !(el.disabled === true);
+  const directCandidates = [
+    ...document.querySelectorAll('div[role="button"][aria-label="Comment"], button[aria-label="Comment"], [role="button"][aria-label="Comment"]')
+  ];
+  const textCandidates = [...document.querySelectorAll('div[role="button"],button')]
+    .filter(el => (el.textContent || '').trim() === 'Comment');
+  const candidates = [...directCandidates, ...textCandidates];
+  return candidates.some(el => isVisible(el) && isEnabled(el));
+})()
+"""
+    value = await _evaluate_js(browser_session, script)
+    return bool(value)
 
-async def run_fb_task(
-    task_description: str,
-    context_id: str,
-    on_captcha=None,
-) -> str:
-    """Run a Facebook task using a persisted context (user already logged in).
 
-    If the session is no longer logged in (cookies expired), returns an error
-    prompting the user to log in again.  If a CAPTCHA/checkpoint appears,
-    the on_captcha callback is used to notify the user.
+async def _force_click_comment_button(browser_session: BrowserSession) -> tuple[bool, str]:
+    click_script = r"""
+(() => {
+  const isVisible = (el) => !!el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
+  const isEnabled = (el) => !!el && el.getAttribute('aria-disabled') !== 'true' && !(el.disabled === true);
+  const clickElement = (el) => {
+    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type => {
+      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+    });
+    if (typeof el.click === 'function') el.click();
+  };
+
+  const selectorCandidates = [
+    'div[role="button"][aria-label="Comment"]',
+    'button[aria-label="Comment"]',
+    '[role="button"][aria-label="Comment"]'
+  ];
+
+  for (const selector of selectorCandidates) {
+    const nodes = [...document.querySelectorAll(selector)];
+    for (const node of nodes) {
+      if (isVisible(node) && isEnabled(node)) {
+        clickElement(node);
+        return { clicked: true, strategy: selector };
+      }
+    }
+  }
+
+  const textMatches = [...document.querySelectorAll('div[role="button"],button')]
+    .filter(el => (el.textContent || '').trim() === 'Comment');
+  for (const node of textMatches) {
+    if (isVisible(node) && isEnabled(node)) {
+      clickElement(node);
+      return { clicked: true, strategy: 'text-content' };
+    }
+  }
+
+  return { clicked: false, strategy: 'none' };
+})()
+"""
+
+    before_visible = await _comment_composer_has_visible_submit_button(browser_session)
+    if not before_visible:
+        return False, "No visible Comment submit button found before fallback click."
+
+    for attempt in range(1, COMMENT_CLICK_FALLBACK_ATTEMPTS + 1):
+        value = await _evaluate_js(browser_session, click_script)
+        logger.info("Comment-click JS fallback attempt %s result: %s", attempt, value)
+        if value and value.get("clicked"):
+            await asyncio.sleep(COMMENT_CLICK_FALLBACK_SLEEP_SECONDS)
+            return True, f"Deterministic Comment click executed via fallback (attempt {attempt})."
+
+    return False, "Comment submit fallback could not click any visible Comment button."
+
+
+async def _persist_session_state(browser_session: BrowserSession) -> None:
+    try:
+        updated_state = await browser_session.export_storage_state()
+        if updated_state:
+            save_session(updated_state)
+    except Exception:
+        logger.exception("Could not export storage_state after agent run")
+
+
+def _build_task(task_description: str, has_session: bool) -> str:
     """
-    client = AsyncStagehand()
-    session = None
+    Wrap the user's task with a login-aware preface.
+
+    The app requires a manually saved session. If Facebook asks for login again,
+    stop and tell the user to reconnect.
+    """
+    efficiency_rules = (
+        "EFFICIENCY RULES (critical — follow strictly):\n"
+        "- Return MULTIPLE actions in a single response whenever the next steps are "
+        "predictable from the current screen. Do not stop after each action.\n"
+        "- For the composer flow, emit ONE response containing: click the 'What's on your "
+        "mind' opener, type the post text, then click Post. Do not split.\n"
+        "- Only break the batch if you actually need to read new page state (e.g. a "
+        "checkpoint, 2FA, or unexpected dialog appears).\n"
+        "- DONE CONDITION: the moment the requested action is visibly performed (post "
+        "appears in feed, message sent, comment submitted, etc.), call the `done` tool "
+        "immediately with success=true. Do not keep verifying or navigating.\n"
+        "- If the composer is already open and the Post button is enabled, click Post "
+        "immediately and finish.\n"
+        "- RECOVERY RULE: if a click on Post fails with 'Element index ... not available', "
+        "do not retry the same index. Switch to the evaluate action immediately and click "
+        "Post by stable selector/text.\n"
+        "- VALID ACTION FORMAT: action objects must use browser-use action names and fields "
+        "(example: {'click': {'index': 123}}). Never use unknown fields like "
+        "{'click': {'element_index': 123}}.\n"
+        "- POST CONTENT RULE: do not alter text content, do not add emojis, and do not open "
+        "'Add to your post' menus unless strictly required.\n"
+        "- COMMENT FLOW RULE: when task is to comment on a specific post URL, stay on that exact "
+        "target post page, type the exact provided comment text, then submit comment.\n"
+        "- COMMENT RECOVERY RULE: if comment submission click fails with 'Element index ... not "
+        "available', switch to evaluate action and click a visible Comment submit button by stable "
+        "selector/text instead of retrying stale indices.\n"
+    )
+
+    login_block = (
+        "If a login screen, checkpoint, captcha, identity check, or any sign-in prompt "
+        "appears, stop immediately and report that the user must reconnect Facebook "
+        "manually from Settings. Do not enter credentials or try to solve challenges."
+    )
+
+    if has_session:
+        preface = (
+            f"You are operating an existing logged-in Facebook session. "
+            f"Start by navigating to {FB_URL}.\n"
+            f"If the saved session has expired: {login_block}\n"
+            "Otherwise proceed straight to the task.\n"
+        )
+    else:
+        preface = (
+            f"You need to log in to Facebook first. Navigate to {FB_URL}.\n"
+            f"{login_block}\n"
+            "Once logged in, perform the task below.\n"
+        )
+
+    return f"{preface}\n{efficiency_rules}\nTask:\n{task_description}"
+
+
+async def run_fb_task(task_description: str, context_id: str | None = None, on_captcha=None) -> str:
+    return await _run_on_browser_loop(_run_fb_task_local(task_description, context_id, on_captcha))
+
+
+async def _run_fb_task_local(task_description: str, context_id: str | None = None, on_captcha=None) -> str:
+    """
+    Main entry point. Given a plain-English task, run it on Facebook.
+    browser-use operates the locally saved manual-login browser profile.
+    """
+    session_state = load_session()
+    has_session = session_state is not None
+    if not has_session:
+        return "Login expired. Please log in to Facebook again via Settings."
+
+    session_kwargs: dict[str, Any] = {
+        # The manual login flow uses a persistent Chrome profile. Passing
+        # storage_state as well makes browser-use overwrite that profile.
+        "storage_state": None,
+        "user_data_dir": BROWSER_USER_DATA_DIR,
+        "headless": BROWSER_HEADLESS,
+        "keep_alive": BROWSER_KEEP_OPEN,
+    }
+    if BROWSER_CHANNEL:
+        session_kwargs["channel"] = BROWSER_CHANNEL
+    if BROWSER_USER_AGENT:
+        session_kwargs["user_agent"] = BROWSER_USER_AGENT
+
+    browser_session = BrowserSession(**session_kwargs)
+
+    llm = ChatAnthropic(model=ANTHROPIC_MODEL)
+    full_task = _build_task(task_description, has_session=has_session)
 
     try:
-        session = await client.sessions.start(
-            model_name=STAGEHAND_MODEL,
-            wait_for_captcha_solves=True,
-            browserbase_session_create_params={
-                "browser_settings": {
-                    "context": {"id": context_id, "persist": True},
-                    "solve_captchas": True,
-                    "record_session": True,
-                },
-            },
+        agent = Agent(
+            task=full_task,
+            llm=llm,
+            browser=browser_session,
+            use_thinking=False,
+            flash_mode=True,
+            enable_planning=False,
+            max_actions_per_step=10,
+            max_failures=2,
+            final_response_after_failure=False,
+            include_tool_call_examples=True,
         )
-        session_id = session.id
-        logger.info("Task session started: %s", session_id)
-        logger.info("Debug URL: https://www.browserbase.com/sessions/%s", session_id)
 
-        # Navigate to Facebook
-        await client.sessions.navigate(session_id, url=FB_URL)
-        await asyncio.sleep(3)
+        history = await agent.run(max_steps=35)
+        final_result = history.final_result()
 
-        # Check login status (cookies should be restored from context)
-        state_info = await _get_facebook_state(client, session_id)
-        state = state_info.get("state")
-
-        if state in {"captcha", "checkpoint"}:
-            if on_captcha:
-                logger.info("CAPTCHA/checkpoint detected before action: %s", state)
-                event = await on_captcha(
-                    session_id, state, state_info.get("details", "")
-                )
+        if not history.is_done():
+            if _is_post_publish_task(task_description):
                 try:
-                    await asyncio.wait_for(
-                        event.wait(), timeout=CAPTCHA_WAIT_SECONDS
-                    )
-                except asyncio.TimeoutError:
-                    return f"CAPTCHA was not solved within {CAPTCHA_WAIT_SECONDS}s. Please try again."
-                await asyncio.sleep(CAPTCHA_RESUME_SECONDS)
-                # Re-check login
-                if not await _is_logged_in(client, session_id):
-                    return "Login expired. Please log in to Facebook again via Settings."
-            else:
-                return "Login expired (security challenge). Please log in to Facebook again via Settings."
+                    clicked, fallback_message = await _force_click_post_button(browser_session)
+                    if clicked:
+                        await _persist_session_state(browser_session)
+                        return fallback_message
+                    logger.warning("Post publish fallback did not complete: %s", fallback_message)
+                except Exception:
+                    logger.exception("Deterministic post publish fallback failed")
+            elif _is_comment_publish_task(task_description):
+                try:
+                    clicked, fallback_message = await _force_click_comment_button(browser_session)
+                    if clicked:
+                        await _persist_session_state(browser_session)
+                        return fallback_message
+                    logger.warning("Comment publish fallback did not complete: %s", fallback_message)
+                except Exception:
+                    logger.exception("Deterministic comment publish fallback failed")
 
-        elif state != "feed":
-            return "Login expired. Please log in to Facebook again via Settings."
+        if history.has_errors() and not history.is_done():
+            last_error = next((err for err in reversed(history.errors()) if err), None)
+            return f"Agent failed before completion: {last_error}" if last_error else "Agent failed before completion."
 
-        # Execute the action
-        action, content, target_url = _parse_task(task_description)
+        if not history.is_done():
+            return "Agent stopped before confirming the task was done."
 
-        if action == "post":
-            return await _do_post(client, session_id, content)
-        elif action == "comment":
-            return await _do_comment(client, session_id, target_url, content)
-        else:
-            return await _do_generic(client, session_id, task_description)
+        await _persist_session_state(browser_session)
+
+        return final_result or "Task completed."
 
     except Exception:
         logger.exception("Agent run failed")
         return "Agent failed during execution. Check the backend logs."
     finally:
-        if session:
+        if not BROWSER_KEEP_OPEN:
             try:
-                await client.sessions.end(session.id)
-                logger.info("Task session ended.")
+                await browser_session.stop()
             except Exception:
                 pass

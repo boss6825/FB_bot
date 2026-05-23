@@ -14,7 +14,7 @@ export const api = {
   health: () => jsonFetch('/health'),
   setupStatus: () => jsonFetch('/status/setup'),
 
-  // Login flow (user logs in manually via Browserbase session)
+  // Login flow (user logs in manually via configured browser provider)
   startLogin: () => jsonFetch('/auth/login/start', { method: 'POST' }),
   verifyLogin: (sessionId) =>
     jsonFetch(`/auth/login/verify/${sessionId}`, { method: 'POST' }),

@@ -13,8 +13,8 @@ const IconExternalLink = ({ size = 20 }) => (
 )
 
 /**
- * Login modal — the user logs into Facebook manually via a Browserbase
- * cloud browser session.  No credentials are stored on the backend.
+ * Login modal — the user logs into Facebook manually in the configured
+ * browser provider. No credentials are stored on the backend.
  *
  * States: idle → starting → waiting → verifying → (success | error)
  */
@@ -23,6 +23,7 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
   const [sessionId, setSessionId] = useState(null)
   const [sessionUrl, setSessionUrl] = useState(null)
   const [liveViewUrl, setLiveViewUrl] = useState(null)
+  const [loginMode, setLoginMode] = useState('browserbase')
   const [error, setError] = useState('')
   const [verifyHint, setVerifyHint] = useState('')
   const [loggingOut, setLoggingOut] = useState(false)
@@ -36,6 +37,7 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
       setSessionId(data.session_id)
       setSessionUrl(data.session_url)
       setLiveViewUrl(data.live_view_url || null)
+      setLoginMode(data.mode || 'browserbase')
       setPhase('waiting')
     } catch (e) {
       setError(e.message || 'Failed to start login session')
@@ -75,6 +77,7 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
     setSessionId(null)
     setSessionUrl(null)
     setLiveViewUrl(null)
+    setLoginMode('browserbase')
     setPhase('idle')
     setError('')
     setVerifyHint('')
@@ -112,7 +115,7 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
               <div>
                 <div style={styles.connectedTitle}>Facebook Connected</div>
                 <div style={styles.connectedSub}>
-                  Your session cookies are saved in Browserbase. No passwords stored.
+                  Your session cookies are saved in the local browser profile. No passwords stored.
                 </div>
               </div>
             </div>
@@ -155,8 +158,8 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
           {phase === 'idle' && (
             <>
               <p style={styles.description}>
-                Log into Facebook in a secure cloud browser. No credentials are stored
-                on this server — only session cookies are saved for automation.
+                Log into Facebook manually. No credentials are stored on this server —
+                only session cookies are saved for automation.
               </p>
               <button style={styles.primaryBtn} onClick={handleStartLogin}>
                 Login to Facebook
@@ -175,10 +178,11 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
             <>
               <div style={styles.banner}>
                 <span>
-                  Navigate to <strong>facebook.com</strong> in the URL bar below,
-                  log in (handle any OTP / 2FA), then click <strong>I&apos;m Logged In</strong>.
+                  {loginMode === 'local_browser'
+                    ? <>A local browser window opened on the backend machine. Log into Facebook there, handle any OTP / 2FA, then click <strong>I&apos;m Logged In</strong>.</>
+                    : <>Navigate to <strong>facebook.com</strong> in the URL bar below, log in (handle any OTP / 2FA), then click <strong>I&apos;m Logged In</strong>.</>}
                 </span>
-                {sessionUrl && (
+                {sessionUrl && loginMode !== 'local_browser' && (
                   <a
                     href={sessionUrl}
                     target="_blank"
@@ -191,9 +195,20 @@ export default function CredentialModal({ isSetup, onClose, onSave, onLogout }) 
                 )}
               </div>
 
-              {liveViewUrl ? (
+              {loginMode === 'local_browser' ? (
+                <div style={styles.localBrowserCard}>
+                  <IconExternalLink size={18} />
+                  <div>
+                    <div style={styles.localBrowserTitle}>Use the browser window that just opened</div>
+                    <div style={styles.localBrowserSub}>
+                      Browser Use runs on this machine, so there is no Browserbase iframe URL.
+                      If the backend is running on a remote server, use remote desktop/VNC to access that browser.
+                    </div>
+                  </div>
+                </div>
+              ) : liveViewUrl ? (
                 <iframe
-                  title="Facebook Login (Browserbase Live View)"
+                  title="Facebook Login Live View"
                   src={liveViewUrl}
                   style={styles.liveView}
                   sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-pointer-lock"
@@ -430,6 +445,27 @@ const styles = {
     borderRadius: 10,
     fontSize: 13,
     color: 'var(--error)',
+  },
+  localBrowserCard: {
+    display: 'flex',
+    gap: 12,
+    alignItems: 'flex-start',
+    padding: 18,
+    minHeight: 180,
+    border: '1px solid var(--border)',
+    borderRadius: 12,
+    background: 'var(--bg-alt)',
+    color: 'var(--text-secondary)',
+  },
+  localBrowserTitle: {
+    fontSize: 14,
+    fontWeight: 700,
+    color: 'var(--text)',
+    marginBottom: 6,
+  },
+  localBrowserSub: {
+    fontSize: 13,
+    lineHeight: 1.6,
   },
   openBrowserBtn: {
     padding: '10px 16px',

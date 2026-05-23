@@ -84,14 +84,13 @@ def setup_status():
     }
 
 
-# ── Login flow (user logs in manually via Browserbase) ────────────
+# ── Login flow (user logs in manually in a local browser) ─────────
 
 @app.post("/auth/login/start")
 async def start_login():
-    """Start a Browserbase session for manual Facebook login.
+    """Start a local browser session for manual Facebook login.
 
-    Returns { session_id, session_url } — the user opens session_url
-    in their browser and logs into Facebook manually.
+    Returns session metadata. In local mode the browser opens on the backend machine.
     """
     from agent import start_login_session
 
@@ -111,6 +110,7 @@ async def start_login():
         "session_id": info["session_id"],
         "session_url": info["session_url"],
         "live_view_url": info.get("live_view_url"),
+        "mode": info.get("mode", "local_browser"),
     }
 
 
@@ -156,7 +156,7 @@ async def cancel_login(session_id: str):
 
 @app.post("/auth/logout")
 async def logout():
-    """Disconnect account: delete Browserbase context + clear local data."""
+    """Disconnect account: clear local browser session/profile data."""
     from agent import end_session as _end
     pending_contexts = []
     for sid, info in list(_login_sessions.items()):
@@ -200,7 +200,7 @@ def get_task_status(task_id: str):
 
 @app.post("/task/{task_id}/captcha-solved")
 def captcha_solved(task_id: str):
-    """User has solved the CAPTCHA in the Browserbase session — unblock the agent."""
+    """User has solved a browser challenge — unblock the agent."""
     event = _captcha_events.get(task_id)
     if not event:
         raise HTTPException(status_code=404, detail="No pending CAPTCHA for this task.")
@@ -266,7 +266,7 @@ def _make_captcha_callback(task_id: str):
             "_pre_captcha_status": pre,
             "captcha_type": state,
             "captcha_details": details,
-            "session_url": f"https://www.browserbase.com/sessions/{session_id}",
+            "session_url": None,
         })
         return event
 
@@ -276,7 +276,7 @@ def _make_captcha_callback(task_id: str):
 # ── Background task runners ──────────────────────────────────────
 
 async def run_task(task_id: str, message: str):
-    """Parse intent, generate content, run Browserbase agent."""
+    """Parse intent, generate content, run local Browser Use agent."""
     try:
         context_id = load_context_id()
         if not context_id:
@@ -444,7 +444,7 @@ async def create_draft(task_id: str, body: DraftRequest):
 
 
 async def publish_task(task_id: str, content: str, action: str, target_url: str | None):
-    """Build agent task string and run Browserbase automation with user-confirmed text."""
+    """Build agent task string and run local Browser Use automation with user-confirmed text."""
     try:
         context_id = load_context_id()
         if not context_id:

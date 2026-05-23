@@ -1,8 +1,10 @@
 anthropic>=0.76.0
+browser-use==0.12.6
+browser-use-sdk==2.0.15
 cryptography>=48.0.0
 fastapi>=0.136.0
 httpx>=0.28.0
+playwright==1.59.0
 pydantic>=2.12.0
 python-dotenv>=1.2.0
-stagehand>=0.1.0
 uvicorn>=0.46.0
