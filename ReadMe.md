@@ -111,19 +111,21 @@ If the agent encounters a sign-in prompt, checkpoint, or CAPTCHA mid-run, it sto
 
 ## API summary
 
-| Method | Endpoint | Purpose |
-|---|---|---|
-| GET | `/health` | Health check |
-| GET | `/status/setup` | Whether a saved session exists |
-| POST | `/auth/login/start` | Open a local Chrome window for manual FB login |
-| POST | `/auth/login/verify/{session_id}` | Confirm login, persist cookies/storage state |
-| POST | `/auth/login/cancel/{session_id}` | Cancel the login window |
-| POST | `/auth/logout` | Clear saved session + persistent profile |
-| POST | `/draft` | Generate post/comment text only |
-| POST | `/draft/{id}/publish` | Publish approved draft via browser automation |
-| POST | `/chat` | Legacy one-shot flow (no draft step) |
-| GET | `/task/{task_id}` | Poll task state/result |
-| POST | `/task/{task_id}/captcha-solved` | Resume an automation task waiting on a CAPTCHA |
+
+| Method | Endpoint                          | Purpose                                        |
+| ------ | --------------------------------- | ---------------------------------------------- |
+| GET    | `/health`                         | Health check                                   |
+| GET    | `/status/setup`                   | Whether a saved session exists                 |
+| POST   | `/auth/login/start`               | Open a local Chrome window for manual FB login |
+| POST   | `/auth/login/verify/{session_id}` | Confirm login, persist cookies/storage state   |
+| POST   | `/auth/login/cancel/{session_id}` | Cancel the login window                        |
+| POST   | `/auth/logout`                    | Clear saved session + persistent profile       |
+| POST   | `/draft`                          | Generate post/comment text only                |
+| POST   | `/draft/{id}/publish`             | Publish approved draft via browser automation  |
+| POST   | `/chat`                           | Legacy one-shot flow (no draft step)           |
+| GET    | `/task/{task_id}`                 | Poll task state/result                         |
+| POST   | `/task/{task_id}/captcha-solved`  | Resume an automation task waiting on a CAPTCHA |
+
 
 Task statuses: `processing`, `draft`, `publishing`, `done`, `error`, `captcha_required`.
 
@@ -131,15 +133,17 @@ Task statuses: `processing`, `draft`, `publishing`, `done`, `error`, `captcha_re
 
 The backend reads environment variables from `backend/.env`.
 
-| Variable | Required | Default | Notes |
-|---|---|---|---|
-| `ANTHROPIC_API_KEY` | Yes | - | Claude API key |
-| `ANTHROPIC_MODEL` | No | `claude-haiku-4-5-20251001` | Used for intent parsing, copy generation, and the browser-use agent |
-| `BROWSER_HEADLESS` | No | `false` | Headless mode for the automation runs. Login window is always visible. |
-| `BROWSER_KEEP_OPEN` | No | `false` | Keep the automation browser alive between tasks |
-| `BROWSER_USER_DATA_DIR` | No | `backend/storage/persistent-profile` | Persistent Chrome profile (cookies survive here) |
-| `BROWSER_CHANNEL` | No | `chrome` | `chrome` uses installed Chrome (preferred); `chromium` uses Playwright's bundled build |
-| `BROWSER_USER_AGENT` | No | - | Optional UA override |
+
+| Variable                | Required | Default                              | Notes                                                                                  |
+| ----------------------- | -------- | ------------------------------------ | -------------------------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`     | Yes      | -                                    | Claude API key                                                                         |
+| `ANTHROPIC_MODEL`       | No       | `claude-haiku-4-5-20251001`          | Used for intent parsing, copy generation, and the browser-use agent                    |
+| `BROWSER_HEADLESS`      | No       | `false`                              | Headless mode for the automation runs. Login window is always visible.                 |
+| `BROWSER_KEEP_OPEN`     | No       | `false`                              | Keep the automation browser alive between tasks                                        |
+| `BROWSER_USER_DATA_DIR` | No       | `backend/storage/persistent-profile` | Persistent Chrome profile (cookies survive here)                                       |
+| `BROWSER_CHANNEL`       | No       | `chrome`                             | `chrome` uses installed Chrome (preferred); `chromium` uses Playwright's bundled build |
+| `BROWSER_USER_AGENT`    | No       | -                                    | Optional UA override                                                                   |
+
 
 ## Data and storage
 
@@ -169,13 +173,13 @@ FB_bot/
 
 ## Limitations
 
-- Local/single-user only — the persistent Chrome profile is shared, so this is not multi-tenant.
 - Facebook UI changes can break the agent's selectors. The deterministic Post/Comment fallback in `agent.py` is the main defense; if FB renames the aria-labels, that JS will need updating.
 
 ## Troubleshooting
 
-- **`Backend is offline`** — make sure `uvicorn main:app --reload --port 8000` is running in `backend/`.
-- **`Login expired`** — cookies aged out or Facebook invalidated the session. Reconnect via Settings.
+- `**Backend is offline**` — make sure `uvicorn main:app --reload --port 8000` is running in `backend/`.
+- `**Login expired**` — cookies aged out or Facebook invalidated the session. Reconnect via Settings.
 - **Login window doesn't open** — make sure Chrome is installed, or set `BROWSER_CHANNEL=chromium` and run `playwright install chromium`.
 - **Post button never clicks** — check backend logs for the `Post-click fallback attempt` lines; if all three attempts fail, Facebook likely changed its composer DOM and the locator script in `agent.py` needs updating.
 - **Stuck in `processing`** — inspect logs; the agent loop runs on a separate thread so tracebacks land in stdout, not the FastAPI request log.
+
